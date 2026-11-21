@@ -1,10 +1,12 @@
 #pragma once
-// Minimal Matroska (MKV) writer for a single H.264 video track.
+// Minimal Matroska (MKV) writer: one H.264 video track + up to a few AAC audio tracks.
 // Clusters are written whole at every keyframe (~2 s), so a crash loses at most ~2 s.
+// Thread-safe: video and audio threads may call the Write* functions concurrently.
 
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -19,9 +21,19 @@ public:
         return m_file != INVALID_HANDLE_VALUE;
     }
 
-    // One H.264 access unit in Annex-B format (start codes). ptsMs = timestamp in ms.
+    // Must be called before the first video frame is written.
+    void AddAudioTrack(int number, int sampleRate, int channels, const uint8_t* asc, size_t ascLen, const char* name) {
+        std::lock_guard<std::mutex> lk(m_mx);
+        AudioTrack t;
+        t.num = number; t.rate = sampleRate; t.ch = channels;
+        t.asc.assign(asc, asc + ascLen);
+        t.name = name;
+        m_audio.push_back(std::move(t));
+    }
+
     // Optional: SPS/PPS from the encoder's output type (Annex-B blob).
     void SetSequenceHeader(const uint8_t* d, size_t n) {
+        std::lock_guard<std::mutex> lk(m_mx);
         std::vector<Nal> nals;
         SplitNals(d, n, nals);
         for (auto& x : nals) {
@@ -31,9 +43,14 @@ public:
             if (t == 8) m_pps.assign(x.p, x.p + x.n);
         }
     }
-    bool HasParamSets() const { return !m_sps.empty() && !m_pps.empty(); }
+    bool HasParamSets() {
+        std::lock_guard<std::mutex> lk(m_mx);
+        return !m_sps.empty() && !m_pps.empty();
+    }
 
+    // One H.264 access unit (Annex-B or length-prefixed). ptsMs = timestamp in ms.
     void WriteAccessUnit(const uint8_t* data, size_t size, int64_t ptsMs, bool keyHint = false) {
+        std::lock_guard<std::mutex> lk(m_mx);
         if (m_file == INVALID_HANDLE_VALUE) return;
 
         std::vector<Nal> nals;
@@ -51,12 +68,11 @@ public:
 
         Buf payload;
         bool key = false;
-        Buf sps, pps;
         for (auto& n : nals) {
             if (n.n == 0) continue;
             int type = n.p[0] & 0x1F;
-            if (type == 7) { sps.assign(n.p, n.p + n.n); continue; }
-            if (type == 8) { pps.assign(n.p, n.p + n.n); continue; }
+            if (type == 7) { m_sps.assign(n.p, n.p + n.n); continue; }
+            if (type == 8) { m_pps.assign(n.p, n.p + n.n); continue; }
             if (type == 9) continue;  // access unit delimiter
             if (type == 5) key = true;
             payload.push_back((n.n >> 24) & 0xFF);
@@ -67,16 +83,14 @@ public:
         }
         if (payload.empty()) return;
         if (keyHint) key = true;
-        if (!sps.empty()) m_sps = sps;
-        if (!pps.empty()) m_pps = pps;
-        sps = m_sps;
-        pps = m_pps;
 
+        bool firstWrite = false;
         if (!m_headerDone) {
-            if (!key || sps.empty() || pps.empty()) return;  // wait for first keyframe + SPS/PPS
-            WriteHeader(sps, pps);
+            if (!key || m_sps.empty() || m_pps.empty()) return;  // wait for first keyframe + SPS/PPS
+            WriteHeader();
             m_headerDone = true;
             m_basePts = ptsMs;
+            firstWrite = true;
         }
 
         int64_t t = ptsMs - m_basePts;
@@ -85,19 +99,33 @@ public:
             FlushCluster();
             m_clusterTs = t;
         }
-        int64_t rel = t - m_clusterTs;
-        if (rel > 32767) rel = 32767;
+        AppendBlock(1, t, key, payload.data(), payload.size());
 
-        Buf blk;
-        blk.push_back(0x81);  // track number 1
-        blk.push_back((rel >> 8) & 0xFF);
-        blk.push_back(rel & 0xFF);
-        blk.push_back(key ? 0x80 : 0x00);
-        blk.insert(blk.end(), payload.begin(), payload.end());
-        Elem(m_cluster, 0xA3, blk);
+        if (firstWrite) {  // audio that arrived before the first keyframe
+            for (auto& p : m_pending) {
+                int64_t at = p.ptsMs - m_basePts;
+                if (at >= 0) AppendBlock(p.track, at, true, p.data.data(), p.data.size());
+            }
+            m_pending.clear();
+        }
+    }
+
+    // One raw AAC frame for the given audio track.
+    void WriteAudio(int track, const uint8_t* d, size_t n, int64_t ptsMs) {
+        std::lock_guard<std::mutex> lk(m_mx);
+        if (m_file == INVALID_HANDLE_VALUE) return;
+        if (!m_headerDone) {
+            if (m_pending.size() < 4000) m_pending.push_back({track, Buf(d, d + n), ptsMs});
+            return;
+        }
+        int64_t t = ptsMs - m_basePts;
+        if (t < 0) return;
+        if (m_cluster.empty()) m_clusterTs = t;
+        AppendBlock(track, t, true, d, n);
     }
 
     void Close() {
+        std::lock_guard<std::mutex> lk(m_mx);
         if (m_file == INVALID_HANDLE_VALUE) return;
         FlushCluster();
         CloseHandle(m_file);
@@ -107,19 +135,24 @@ public:
 private:
     using Buf = std::vector<uint8_t>;
     struct Nal { const uint8_t* p; size_t n; };
+    struct AudioTrack { int num = 2, rate = 48000, ch = 2; Buf asc; std::string name; };
+    struct Pending { int track; Buf data; int64_t ptsMs; };
 
+    std::mutex m_mx;
     HANDLE m_file = INVALID_HANDLE_VALUE;
     int m_w = 0, m_h = 0, m_fps = 30;
     bool m_headerDone = false;
     int64_t m_basePts = 0, m_clusterTs = 0;
     Buf m_cluster;
     Buf m_sps, m_pps;
+    std::vector<AudioTrack> m_audio;
+    std::vector<Pending> m_pending;
 
     static void SplitNals(const uint8_t* d, size_t sz, std::vector<Nal>& out) {
         ptrdiff_t start = -1;
         size_t i = 0;
         auto push = [&](ptrdiff_t s, size_t e) {
-            while (e > (size_t)s && d[e - 1] == 0) --e;  // trailing zero bytes belong to the next start code
+            while (e > (size_t)s && d[e - 1] == 0) --e;
             if (e > (size_t)s) out.push_back({d + s, e - (size_t)s});
         };
         while (i + 2 < sz) {
@@ -157,8 +190,13 @@ private:
         for (int i = n - 1; i >= 0; --i) p.push_back((v >> (8 * i)) & 0xFF);
         Elem(b, id, p);
     }
-    static void ElemStr(Buf& b, uint32_t id, const char* s) {
-        Elem(b, id, (const uint8_t*)s, strlen(s));
+    static void ElemStr(Buf& b, uint32_t id, const char* s) { Elem(b, id, (const uint8_t*)s, strlen(s)); }
+    static void ElemDouble(Buf& b, uint32_t id, double v) {
+        uint64_t bits;
+        memcpy(&bits, &v, 8);
+        Buf p;
+        for (int s = 56; s >= 0; s -= 8) p.push_back((bits >> s) & 0xFF);
+        Elem(b, id, p);
     }
 
     void Write(const Buf& b) {
@@ -166,7 +204,22 @@ private:
         WriteFile(m_file, b.data(), (DWORD)b.size(), &written, nullptr);
     }
 
-    void WriteHeader(const Buf& sps, const Buf& pps) {
+    void AppendBlock(int track, int64_t tMs, bool key, const uint8_t* d, size_t n) {
+        int64_t rel = tMs - m_clusterTs;
+        if (rel > 32767) rel = 32767;
+        if (rel < -32768) rel = -32768;
+        uint16_t r = (uint16_t)(int16_t)rel;
+        Buf blk;
+        blk.reserve(n + 4);
+        blk.push_back(0x80 | (track & 0x7F));
+        blk.push_back((r >> 8) & 0xFF);
+        blk.push_back(r & 0xFF);
+        blk.push_back(key ? 0x80 : 0x00);
+        blk.insert(blk.end(), d, d + n);
+        Elem(m_cluster, 0xA3, blk);
+    }
+
+    void WriteHeader() {
         Buf ebml;
         ElemUInt(ebml, 0x4286, 1);
         ElemUInt(ebml, 0x42F7, 1);
@@ -179,8 +232,7 @@ private:
         Buf out;
         Elem(out, 0x1A45DFA3, ebml);
 
-        // Segment with unknown size (valid for live/crash-safe writing)
-        PutId(out, 0x18538067);
+        PutId(out, 0x18538067);  // Segment, unknown size
         const uint8_t unknown[8] = {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
         out.insert(out.end(), unknown, unknown + 8);
 
@@ -192,35 +244,51 @@ private:
 
         Buf avcc;
         avcc.push_back(1);
-        avcc.push_back(sps[1]);
-        avcc.push_back(sps[2]);
-        avcc.push_back(sps[3]);
-        avcc.push_back(0xFF);  // 4-byte NAL lengths
-        avcc.push_back(0xE1);  // one SPS
-        avcc.push_back((sps.size() >> 8) & 0xFF);
-        avcc.push_back(sps.size() & 0xFF);
-        avcc.insert(avcc.end(), sps.begin(), sps.end());
-        avcc.push_back(1);     // one PPS
-        avcc.push_back((pps.size() >> 8) & 0xFF);
-        avcc.push_back(pps.size() & 0xFF);
-        avcc.insert(avcc.end(), pps.begin(), pps.end());
-
-        Buf video;
-        ElemUInt(video, 0xB0, m_w);
-        ElemUInt(video, 0xBA, m_h);
-
-        Buf te;
-        ElemUInt(te, 0xD7, 1);       // track number
-        ElemUInt(te, 0x73C5, 1);     // track UID
-        ElemUInt(te, 0x83, 1);       // type: video
-        ElemUInt(te, 0x9C, 0);       // no lacing
-        ElemStr(te, 0x86, "V_MPEG4/ISO/AVC");
-        Elem(te, 0x63A2, avcc);
-        ElemUInt(te, 0x23E383, 1000000000ull / (m_fps > 0 ? m_fps : 30));
-        Elem(te, 0xE0, video);
+        avcc.push_back(m_sps[1]);
+        avcc.push_back(m_sps[2]);
+        avcc.push_back(m_sps[3]);
+        avcc.push_back(0xFF);
+        avcc.push_back(0xE1);
+        avcc.push_back((m_sps.size() >> 8) & 0xFF);
+        avcc.push_back(m_sps.size() & 0xFF);
+        avcc.insert(avcc.end(), m_sps.begin(), m_sps.end());
+        avcc.push_back(1);
+        avcc.push_back((m_pps.size() >> 8) & 0xFF);
+        avcc.push_back(m_pps.size() & 0xFF);
+        avcc.insert(avcc.end(), m_pps.begin(), m_pps.end());
 
         Buf tracks;
-        Elem(tracks, 0xAE, te);
+        {
+            Buf video;
+            ElemUInt(video, 0xB0, m_w);
+            ElemUInt(video, 0xBA, m_h);
+            Buf te;
+            ElemUInt(te, 0xD7, 1);
+            ElemUInt(te, 0x73C5, 1);
+            ElemUInt(te, 0x83, 1);
+            ElemUInt(te, 0x9C, 0);
+            ElemStr(te, 0x86, "V_MPEG4/ISO/AVC");
+            Elem(te, 0x63A2, avcc);
+            ElemUInt(te, 0x23E383, 1000000000ull / (m_fps > 0 ? m_fps : 30));
+            Elem(te, 0xE0, video);
+            Elem(tracks, 0xAE, te);
+        }
+        for (auto& a : m_audio) {
+            Buf au;
+            ElemDouble(au, 0xB5, (double)a.rate);
+            ElemUInt(au, 0x9F, a.ch);
+            Buf te;
+            ElemUInt(te, 0xD7, a.num);
+            ElemUInt(te, 0x73C5, a.num);
+            ElemUInt(te, 0x83, 2);
+            ElemUInt(te, 0x9C, 0);
+            ElemStr(te, 0x86, "A_AAC");
+            ElemStr(te, 0x536E, a.name.c_str());
+            Elem(te, 0x63A2, a.asc);
+            ElemUInt(te, 0x23E383, 1024ull * 1000000000ull / a.rate);
+            Elem(te, 0xE1, au);
+            Elem(tracks, 0xAE, te);
+        }
         Elem(out, 0x1654AE6B, tracks);
         Write(out);
     }
@@ -228,7 +296,7 @@ private:
     void FlushCluster() {
         if (m_cluster.empty()) return;
         Buf c;
-        ElemUInt(c, 0xE7, (uint64_t)m_clusterTs);
+        ElemUInt(c, 0xE7, (uint64_t)(m_clusterTs < 0 ? 0 : m_clusterTs));
         c.insert(c.end(), m_cluster.begin(), m_cluster.end());
         Buf out;
         Elem(out, 0x1F43B675, c);
