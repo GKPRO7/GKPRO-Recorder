@@ -19,6 +19,9 @@
 #include <codecapi.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -30,6 +33,16 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 constexpr int kPool = 12;  // NV12 720p frames are only ~1.4 MB each
+
+void LogLine(const std::wstring& path, const char* text) {
+    HANDLE f = CreateFileW((path + L".log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(f, text, (DWORD)strlen(text), &w, nullptr);
+    WriteFile(f, "\r\n", 2, &w, nullptr);
+    CloseHandle(f);
+}
 
 void SetCodec(ICodecAPI* c, const GUID& key, ULONG v) {
     if (!c) return;
@@ -279,6 +292,19 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     // ---------- Encoder event handling ----------
     int needInput = 0;
     bool drained = false;
+    int nSubmitted = 0, nOutputs = 0, nNeedEvents = 0, nInputFail = 0, nBltFail = 0;
+    char lb[256];
+
+    auto grabSeqHeader = [&]() {
+        if (mkv.HasParamSets()) return;
+        ComPtr<IMFMediaType> cur;
+        if (FAILED(mft->GetOutputCurrentType(0, &cur))) return;
+        UINT32 sz = 0;
+        if (FAILED(cur->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &sz)) || sz == 0) return;
+        std::vector<uint8_t> blob(sz);
+        if (SUCCEEDED(cur->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, blob.data(), sz, nullptr)))
+            mkv.SetSequenceHeader(blob.data(), sz);
+    };
 
     auto pullOutput = [&]() {
         MFT_OUTPUT_STREAM_INFO si = {};
@@ -298,7 +324,20 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         if (ob.pEvents) ob.pEvents->Release();
         ComPtr<IMFSample> got;
         if (provides) got.Attach(ob.pSample); else got = own;
+        if (h == MF_E_TRANSFORM_STREAM_CHANGE) {
+            ComPtr<IMFMediaType> nt;
+            if (SUCCEEDED(mft->GetOutputAvailableType(0, 0, &nt))) mft->SetOutputType(0, nt.Get(), 0);
+            return;
+        }
         if (FAILED(h) || !got) return;
+        ++nOutputs;
+        if (nOutputs == 1) {
+            sprintf_s(lb, "first encoder output received (%s)", mkv.HasParamSets() ? "have SPS/PPS" : "no SPS/PPS yet");
+            LogLine(path, lb);
+        }
+        grabSeqHeader();
+        UINT32 clean = 0;
+        got->GetUINT32(MFSampleExtension_CleanPoint, &clean);
 
         ComPtr<IMFMediaBuffer> cb;
         if (FAILED(got->ConvertToContiguousBuffer(&cb))) return;
@@ -307,7 +346,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         if (SUCCEEDED(cb->Lock(&p, nullptr, &len))) {
             LONGLONG t = 0;
             got->GetSampleTime(&t);
-            mkv.WriteAccessUnit(p, len, t / 10000);  // 100 ns -> ms
+            mkv.WriteAccessUnit(p, len, t / 10000, clean != 0);  // 100 ns -> ms
             cb->Unlock();
         }
     };
@@ -318,7 +357,13 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
             if (FAILED(gen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev))) break;
             MediaEventType t = MEUnknown;
             ev->GetType(&t);
-            if (t == METransformNeedInput) ++needInput;
+            if (t == METransformNeedInput) { ++needInput; ++nNeedEvents; }
+            else if (t == MEError) {
+                HRESULT st = S_OK;
+                ev->GetStatus(&st);
+                sprintf_s(lb, "encoder error event 0x%08X", (unsigned)st);
+                LogLine(path, lb);
+            }
             else if (t == METransformHaveOutput) pullOutput();
             else if (t == METransformDrainComplete) drained = true;
         }
@@ -332,6 +377,10 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         timeBeginPeriod(1);
         plainTimer = true;
     }
+
+    grabSeqHeader();
+    sprintf_s(lb, "start: capture %ux%u -> %ux%u @ %d fps, %d kbps", srcW, srcH, outW, outH, fps, kbps);
+    LogLine(path, lb);
 
     m_ready = true;
 
@@ -384,7 +433,12 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
             D3D11_VIDEO_PROCESSOR_STREAM st = {};
             st.Enable = TRUE;
             st.pInputSurface = inView.Get();
-            if (SUCCEEDED(vctx->VideoProcessorBlt(vp.Get(), outViews[slot].Get(), 0, 1, &st))) {
+            HRESULT bh = vctx->VideoProcessorBlt(vp.Get(), outViews[slot].Get(), 0, 1, &st);
+            if (FAILED(bh) && ++nBltFail <= 3) {
+                sprintf_s(lb, "VideoProcessorBlt failed 0x%08X", (unsigned)bh);
+                LogLine(path, lb);
+            }
+            if (SUCCEEDED(bh)) {
                 ComPtr<IMFMediaBuffer> buf;
                 if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), pool[slot].Get(), 0, FALSE, &buf))) {
                     buf->SetCurrentLength(outW * outH * 3 / 2);
@@ -393,9 +447,14 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
                     sample->AddBuffer(buf.Get());
                     sample->SetSampleTime(idx * dur100ns);
                     sample->SetSampleDuration(dur100ns);
-                    if (SUCCEEDED(mft->ProcessInput(0, sample.Get(), 0))) {
+                    HRESULT ph = mft->ProcessInput(0, sample.Get(), 0);
+                    if (SUCCEEDED(ph)) {
                         --needInput;
+                        ++nSubmitted;
                         slot = (slot + 1) % kPool;
+                    } else if (++nInputFail <= 3) {
+                        sprintf_s(lb, "ProcessInput failed 0x%08X", (unsigned)ph);
+                        LogLine(path, lb);
                     }
                 }
             }
@@ -413,6 +472,9 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     }
     pump();
     mkv.Close();
+    sprintf_s(lb, "stop: need-input events=%d, frames submitted=%d, encoder outputs=%d, header=%s",
+              nNeedEvents, nSubmitted, nOutputs, mkv.HasParamSets() ? "yes" : "no");
+    LogLine(path, lb);
 
     mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
