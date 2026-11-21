@@ -132,6 +132,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (!RegisterHotKey(hwnd, HOTKEY_ID, MOD_NOREPEAT, VK_F9))
         Balloon(L"GKPRO Recorder", L"F9 is in use by another app. Use the tray menu instead.");
 
+    MessageBoxW(nullptr,
+                L"GKPRO Recorder is running in the system tray (near the clock, click the ^ arrow if hidden).\n\n"
+                L"Press F9 to start and stop recording.\n"
+                L"Videos are saved in Videos\\GKPRO Recorder.",
+                L"GKPRO Recorder", MB_OK | MB_ICONINFORMATION);
+
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m);
