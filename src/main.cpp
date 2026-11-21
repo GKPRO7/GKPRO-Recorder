@@ -36,7 +36,7 @@ std::wstring NewFilePath() {
     SYSTEMTIME t;
     GetLocalTime(&t);
     wchar_t name[64];
-    swprintf_s(name, L"\\GKPRO_%04d-%02d-%02d_%02d-%02d-%02d.mp4",
+    swprintf_s(name, L"\\GKPRO_%04d-%02d-%02d_%02d-%02d-%02d.mkv",
                t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     return OutputDir() + name;
 }
