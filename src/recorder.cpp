@@ -1,26 +1,45 @@
-// GKPRO Recorder - capture (DXGI Desktop Duplication) + hardware H.264 (Media Foundation)
-// Frames stay on the GPU the whole way: capture texture -> encoder. No CPU copies.
+// GKPRO Recorder
+// Pipeline (all on the GPU):
+//   Desktop Duplication (BGRA) -> D3D11 video processor (scale to 720p + convert to NV12)
+//   -> hardware H.264 encoder MFT (Intel QuickSync / NVENC / AMF) -> MKV muxer -> disk
 
 #include "recorder.h"
+#include "mkv_writer.h"
 
 #include <windows.h>
+#include <timeapi.h>
+#include <oleauto.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mfidl.h>
-#include <mfreadwrite.h>
+#include <mftransform.h>
+#include <mferror.h>
+#include <strmif.h>
 #include <codecapi.h>
 #include <wrl/client.h>
-#include <vector>
-#include <chrono>
+#include <algorithm>
 
 using Microsoft::WRL::ComPtr;
 
-namespace {
-constexpr int kPoolSize = 8;  // textures in flight; the encoder reads them asynchronously
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
-#define CHECK(hr, msg) do { if (FAILED(hr)) { err = msg; goto fail; } } while (0)
+#define REQ(hr, msg) do { if (FAILED(hr)) return msg; } while (0)
+
+namespace {
+constexpr int kPool = 12;  // NV12 720p frames are only ~1.4 MB each
+
+void SetCodec(ICodecAPI* c, const GUID& key, ULONG v) {
+    if (!c) return;
+    VARIANT var;
+    VariantInit(&var);
+    var.vt = VT_UI4;
+    var.ulVal = v;
+    c->SetValue(&key, &var);
 }
+}  // namespace
 
 bool Recorder::Start(const std::wstring& path, const RecorderConfig& cfg) {
     if (m_running.load()) return false;
@@ -30,7 +49,6 @@ bool Recorder::Start(const std::wstring& path, const RecorderConfig& cfg) {
     m_running = true;
     m_thread = std::thread(&Recorder::Loop, this, path, cfg);
 
-    // Wait until the capture thread either starts writing or fails.
     while (!m_ready.load() && !m_failed.load()) Sleep(5);
     if (m_failed.load()) {
         if (m_thread.joinable()) m_thread.join();
@@ -46,189 +64,359 @@ void Recorder::Stop() {
 }
 
 void Recorder::Loop(std::wstring path, RecorderConfig cfg) {
-    const wchar_t* err = nullptr;
-    HRESULT hr = S_OK;
-
-    ComPtr<ID3D11Device> dev;
-    ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<IDXGIOutputDuplication> dup;
-    ComPtr<IMFDXGIDeviceManager> devMgr;
-    ComPtr<IMFSinkWriter> writer;
-    ComPtr<ID3D11Texture2D> pool[kPoolSize];
-    ComPtr<ID3D11Texture2D> latest;  // last texture holding a complete frame
-    UINT resetToken = 0;
-    UINT w = 0, h = 0;
-    bool writing = false;
-    int poolIdx = 0;
-    LONGLONG frameIndex = 0;
-
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  // never fight the game
 
-    // ---- D3D11 device ----
+    const wchar_t* err = Session(path, cfg);
+    if (err && !m_ready.load()) {
+        m_error = err;
+        m_failed = true;
+    }
+
+    MFShutdown();
+    CoUninitialize();
+    m_running = false;
+}
+
+const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig& cfg) {
+    HRESULT hr;
+    const int fps = cfg.fps > 0 ? cfg.fps : 30;
+    const UINT outW = (UINT)cfg.outWidth & ~1u;
+    const UINT outH = (UINT)cfg.outHeight & ~1u;
+    const int kbps = cfg.bitrateKbps > 0 ? cfg.bitrateKbps : 5000;
+
+    // ---------- D3D11 device ----------
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                           D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                           nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+    REQ(hr, L"Could not create the GPU device.");
     {
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
-                               D3D11_SDK_VERSION, &dev, nullptr, &ctx);
-        CHECK(hr, L"Could not create the GPU device.");
         ComPtr<ID3D10Multithread> mt;
         if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
     }
 
-    // ---- Desktop Duplication on primary monitor ----
+    // ---------- Desktop Duplication ----------
+    ComPtr<IDXGIOutputDuplication> dup;
+    UINT srcW = 0, srcH = 0;
     {
         ComPtr<IDXGIDevice> dxgiDev;
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<IDXGIOutput> output;
         ComPtr<IDXGIOutput1> output1;
-        hr = dev.As(&dxgiDev);              CHECK(hr, L"DXGI device error.");
-        hr = dxgiDev->GetAdapter(&adapter); CHECK(hr, L"DXGI adapter error.");
-        hr = adapter->EnumOutputs(0, &output); CHECK(hr, L"No monitor found.");
-        hr = output.As(&output1);           CHECK(hr, L"Monitor does not support capture.");
+        hr = dev.As(&dxgiDev);                 REQ(hr, L"DXGI device error.");
+        hr = dxgiDev->GetAdapter(&adapter);    REQ(hr, L"DXGI adapter error.");
+        hr = adapter->EnumOutputs(0, &output); REQ(hr, L"No monitor found.");
+        hr = output.As(&output1);              REQ(hr, L"Monitor does not support capture.");
         hr = output1->DuplicateOutput(dev.Get(), &dup);
-        CHECK(hr, L"Screen capture failed to start (another capture app may be running).");
+        REQ(hr, L"Screen capture failed to start (another capture app may be running).");
         DXGI_OUTDUPL_DESC dd;
         dup->GetDesc(&dd);
-        w = dd.ModeDesc.Width & ~1u;  // H.264 needs even dimensions
-        h = dd.ModeDesc.Height & ~1u;
+        srcW = dd.ModeDesc.Width;
+        srcH = dd.ModeDesc.Height;
     }
 
-    // ---- Texture pool (GPU only) ----
+    // ---------- Capture target (full-res BGRA) ----------
+    ComPtr<ID3D11Texture2D> latest;
     {
         D3D11_TEXTURE2D_DESC td = {};
-        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Width = srcW; td.Height = srcH; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        for (auto& t : pool) {
-            hr = dev->CreateTexture2D(&td, nullptr, &t);
-            CHECK(hr, L"Out of GPU memory.");
+        hr = dev->CreateTexture2D(&td, nullptr, &latest);
+        REQ(hr, L"Out of GPU memory.");
+    }
+
+    // ---------- GPU video processor: scale + BGRA -> NV12 ----------
+    ComPtr<ID3D11VideoDevice> vdev;
+    ComPtr<ID3D11VideoContext> vctx;
+    ComPtr<ID3D11VideoProcessorEnumerator> venum;
+    ComPtr<ID3D11VideoProcessor> vp;
+    ComPtr<ID3D11VideoProcessorInputView> inView;
+    ComPtr<ID3D11Texture2D> pool[kPool];
+    ComPtr<ID3D11VideoProcessorOutputView> outViews[kPool];
+    {
+        hr = dev.As(&vdev);  REQ(hr, L"This GPU has no video processor.");
+        hr = ctx.As(&vctx);  REQ(hr, L"This GPU has no video context.");
+
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
+        cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        cd.InputWidth = srcW;  cd.InputHeight = srcH;
+        cd.OutputWidth = outW; cd.OutputHeight = outH;
+        cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+        hr = vdev->CreateVideoProcessorEnumerator(&cd, &venum); REQ(hr, L"Video processor error.");
+        hr = vdev->CreateVideoProcessor(venum.Get(), 0, &vp);   REQ(hr, L"Video processor error.");
+
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv = {};
+        iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        hr = vdev->CreateVideoProcessorInputView(latest.Get(), venum.Get(), &iv, &inView);
+        REQ(hr, L"Video processor input error.");
+
+        // Keep aspect ratio (letterbox) when the screen is not 16:9.
+        double sc = std::min((double)outW / srcW, (double)outH / srcH);
+        LONG dw = (LONG)(srcW * sc) & ~1, dh = (LONG)(srcH * sc) & ~1;
+        LONG dx = ((LONG)outW - dw) / 2 & ~1, dy = ((LONG)outH - dh) / 2 & ~1;
+        RECT srcRect = {0, 0, (LONG)srcW, (LONG)srcH};
+        RECT dstRect = {dx, dy, dx + dw, dy + dh};
+        RECT target = {0, 0, (LONG)outW, (LONG)outH};
+        vctx->VideoProcessorSetStreamFrameFormat(vp.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+        vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcRect);
+        vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRect);
+        vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &target);
+
+        D3D11_VIDEO_COLOR black = {};
+        black.YCbCr = {0.0625f, 0.5f, 0.5f, 1.0f};
+        vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), TRUE, &black);
+
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCs = {};   // RGB, full range
+        inCs.RGB_Range = 0;
+        vctx->VideoProcessorSetStreamColorSpace(vp.Get(), 0, &inCs);
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCs = {};  // YCbCr BT.709, studio range
+        outCs.YCbCr_Matrix = 1;
+        outCs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        vctx->VideoProcessorSetOutputColorSpace(vp.Get(), &outCs);
+
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = outW; td.Height = outH; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_NV12;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        for (int i = 0; i < kPool; ++i) {
+            hr = dev->CreateTexture2D(&td, nullptr, &pool[i]);
+            REQ(hr, L"Could not create NV12 frames (GPU not supported).");
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {};
+            ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            hr = vdev->CreateVideoProcessorOutputView(pool[i].Get(), venum.Get(), &ov, &outViews[i]);
+            REQ(hr, L"Video processor output error.");
         }
     }
 
-    // ---- Media Foundation hardware encoder ----
+    // ---------- Hardware H.264 encoder (MFT) ----------
+    ComPtr<IMFDXGIDeviceManager> devMgr;  // declared before mft => destroyed after it
+    ComPtr<IMFTransform> mft;
+    ComPtr<IMFMediaEventGenerator> gen;
     {
-        hr = MFCreateDXGIDeviceManager(&resetToken, &devMgr); CHECK(hr, L"MF device manager error.");
-        hr = devMgr->ResetDevice(dev.Get(), resetToken);      CHECK(hr, L"MF device reset error.");
+        UINT token = 0;
+        hr = MFCreateDXGIDeviceManager(&token, &devMgr); REQ(hr, L"MF device manager error.");
+        hr = devMgr->ResetDevice(dev.Get(), token);      REQ(hr, L"MF device reset error.");
 
-        const int fps = cfg.fps > 0 ? cfg.fps : 30;
-        int kbps = cfg.bitrateKbps;
-        if (kbps <= 0) kbps = (int)((double)w * h * fps * 0.07 / 1000.0);  // ~4.3 Mbps for 1080p30
-        if (kbps < 1500) kbps = 1500;
+        MFT_REGISTER_TYPE_INFO outInfo = {MFMediaType_Video, MFVideoFormat_H264};
+        IMFActivate** acts = nullptr;
+        UINT32 count = 0;
+        hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                       nullptr, &outInfo, &acts, &count);
+        if (FAILED(hr) || count == 0) {
+            if (acts) CoTaskMemFree(acts);
+            return L"No hardware H.264 encoder found on this PC.";
+        }
+        hr = acts[0]->ActivateObject(IID_PPV_ARGS(&mft));
+        for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
+        CoTaskMemFree(acts);
+        REQ(hr, L"Could not start the hardware encoder.");
 
-        ComPtr<IMFAttributes> attrs;
-        MFCreateAttributes(&attrs, 5);
-        attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-        attrs->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, devMgr.Get());
-        attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
-        attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-        // Fragmented MP4: file stays playable even if the PC crashes mid-recording.
-        attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_FMPEG4);
+        ComPtr<IMFAttributes> ma;
+        UINT32 isAsync = 0;
+        if (SUCCEEDED(mft->GetAttributes(&ma)) && ma) {
+            ma->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
+            if (isAsync) ma->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            ma->SetUINT32(MF_LOW_LATENCY, TRUE);
+        }
+        if (!isAsync) return L"This encoder type is not supported yet.";
 
-        hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, attrs.Get(), &writer);
-        CHECK(hr, L"Could not create the output file.");
+        mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)devMgr.Get());
 
-        ComPtr<IMFMediaType> out;
-        MFCreateMediaType(&out);
-        out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        out->SetUINT32(MF_MT_AVG_BITRATE, (UINT32)kbps * 1000);
-        out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        out->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
-        MFSetAttributeSize(out.Get(), MF_MT_FRAME_SIZE, w, h);
-        MFSetAttributeRatio(out.Get(), MF_MT_FRAME_RATE, fps, 1);
-        MFSetAttributeRatio(out.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        DWORD stream = 0;
-        hr = writer->AddStream(out.Get(), &stream); CHECK(hr, L"No H.264 encoder available.");
+        ComPtr<ICodecAPI> codec;
+        if (SUCCEEDED(mft.As(&codec))) {
+            SetCodec(codec.Get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR);
+            SetCodec(codec.Get(), CODECAPI_AVEncCommonMeanBitRate, (ULONG)kbps * 1000);
+            SetCodec(codec.Get(), CODECAPI_AVEncCommonMaxBitRate, (ULONG)kbps * 1500);
+            SetCodec(codec.Get(), CODECAPI_AVEncMPVGOPSize, (ULONG)fps * 2);
+            SetCodec(codec.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+            SetCodec(codec.Get(), CODECAPI_AVEncCommonQualityVsSpeed, 50);
+            SetCodec(codec.Get(), CODECAPI_AVEncCommonLowLatency, 1);
+        }
 
-        ComPtr<IMFMediaType> in;
-        MFCreateMediaType(&in);
-        in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);  // matches BGRA textures
-        in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, w, h);
-        MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps, 1);
-        MFSetAttributeRatio(in.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        hr = writer->SetInputMediaType(stream, in.Get(), nullptr);
-        CHECK(hr, L"Encoder rejected the video format.");
+        ComPtr<IMFMediaType> ot;
+        MFCreateMediaType(&ot);
+        ot->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        ot->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        ot->SetUINT32(MF_MT_AVG_BITRATE, (UINT32)kbps * 1000);
+        ot->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        ot->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
+        MFSetAttributeSize(ot.Get(), MF_MT_FRAME_SIZE, outW, outH);
+        MFSetAttributeRatio(ot.Get(), MF_MT_FRAME_RATE, fps, 1);
+        MFSetAttributeRatio(ot.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        hr = mft->SetOutputType(0, ot.Get(), 0);
+        REQ(hr, L"Encoder rejected the output format.");
 
-        hr = writer->BeginWriting(); CHECK(hr, L"Could not start writing.");
-        writing = true;
+        ComPtr<IMFMediaType> it;
+        MFCreateMediaType(&it);
+        it->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        it->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        it->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(it.Get(), MF_MT_FRAME_SIZE, outW, outH);
+        MFSetAttributeRatio(it.Get(), MF_MT_FRAME_RATE, fps, 1);
+        MFSetAttributeRatio(it.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        hr = mft->SetInputType(0, it.Get(), 0);
+        REQ(hr, L"Encoder rejected the input format.");
+
+        hr = mft.As(&gen);
+        REQ(hr, L"Encoder has no event interface.");
+
+        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    }
+
+    // ---------- MKV output ----------
+    MkvWriter mkv;
+    if (!mkv.Open(path, (int)outW, (int)outH, fps)) return L"Could not create the output file.";
+
+    // ---------- Encoder event handling ----------
+    int needInput = 0;
+    bool drained = false;
+
+    auto pullOutput = [&]() {
+        MFT_OUTPUT_STREAM_INFO si = {};
+        mft->GetOutputStreamInfo(0, &si);
+        const bool provides = (si.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+        ComPtr<IMFSample> own;
+        if (!provides) {
+            MFCreateSample(&own);
+            ComPtr<IMFMediaBuffer> mb;
+            MFCreateMemoryBuffer(si.cbSize ? si.cbSize : (1u << 20), &mb);
+            own->AddBuffer(mb.Get());
+        }
+        MFT_OUTPUT_DATA_BUFFER ob = {};
+        ob.pSample = own.Get();
+        DWORD status = 0;
+        HRESULT h = mft->ProcessOutput(0, 1, &ob, &status);
+        if (ob.pEvents) ob.pEvents->Release();
+        ComPtr<IMFSample> got;
+        if (provides) got.Attach(ob.pSample); else got = own;
+        if (FAILED(h) || !got) return;
+
+        ComPtr<IMFMediaBuffer> cb;
+        if (FAILED(got->ConvertToContiguousBuffer(&cb))) return;
+        BYTE* p = nullptr;
+        DWORD len = 0;
+        if (SUCCEEDED(cb->Lock(&p, nullptr, &len))) {
+            LONGLONG t = 0;
+            got->GetSampleTime(&t);
+            mkv.WriteAccessUnit(p, len, t / 10000);  // 100 ns -> ms
+            cb->Unlock();
+        }
+    };
+
+    auto pump = [&]() {
+        for (;;) {
+            ComPtr<IMFMediaEvent> ev;
+            if (FAILED(gen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev))) break;
+            MediaEventType t = MEUnknown;
+            ev->GetType(&t);
+            if (t == METransformNeedInput) ++needInput;
+            else if (t == METransformHaveOutput) pullOutput();
+            else if (t == METransformDrainComplete) drained = true;
+        }
+    };
+
+    // ---------- Precise frame timer ----------
+    bool plainTimer = false;
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) {
+        timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+        timeBeginPeriod(1);
+        plainTimer = true;
     }
 
     m_ready = true;
 
-    // ---- Capture loop ----
-    {
-        const int fps = cfg.fps > 0 ? cfg.fps : 30;
-        const LONGLONG frameDur100ns = 10000000LL / fps;
-        using clock = std::chrono::steady_clock;
-        const auto t0 = clock::now();
+    // ---------- Capture loop ----------
+    LARGE_INTEGER fq, t0;
+    QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&t0);
+    const LONGLONG dur100ns = 10000000LL / fps;
+    LONGLONG idx = 0;
+    bool haveFrame = false;
+    int slot = 0;
 
-        while (m_running.load()) {
-            // Wait until this frame is due (keeps CPU near zero between frames).
-            auto due = t0 + std::chrono::microseconds(frameIndex * 1000000LL / fps);
-            auto now = clock::now();
-            DWORD waitMs = due > now
-                ? (DWORD)std::chrono::duration_cast<std::chrono::milliseconds>(due - now).count()
-                : 0;
+    while (m_running.load()) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        LONGLONG due = t0.QuadPart + idx * fq.QuadPart / fps;
+        if (due > now.QuadPart) {
+            LARGE_INTEGER rel;
+            rel.QuadPart = -((due - now.QuadPart) * 10000000LL / fq.QuadPart);
+            if (rel.QuadPart == 0) rel.QuadPart = -1;
+            SetWaitableTimer(timer, &rel, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(timer, 200);
+        } else if (now.QuadPart - due > 2 * fq.QuadPart / fps) {
+            // Fell behind: skip ahead instead of sending a burst of late frames.
+            idx = (now.QuadPart - t0.QuadPart) * fps / fq.QuadPart;
+        }
 
-            DXGI_OUTDUPL_FRAME_INFO info;
+        // Grab the newest screen image (if the screen changed).
+        {
+            DXGI_OUTDUPL_FRAME_INFO fi;
             ComPtr<IDXGIResource> res;
-            hr = dup->AcquireNextFrame(waitMs, &info, &res);
-            if (hr == DXGI_ERROR_ACCESS_LOST) break;  // display mode changed; MVP just stops cleanly
+            hr = dup->AcquireNextFrame(0, &fi, &res);
+            if (hr == DXGI_ERROR_ACCESS_LOST) break;  // display mode changed
             if (SUCCEEDED(hr)) {
                 ComPtr<ID3D11Texture2D> src;
-                res.As(&src);
-                ID3D11Texture2D* dst = pool[poolIdx].Get();
-                D3D11_BOX box = {0, 0, 0, w, h, 1};
-                ctx->CopySubresourceRegion(dst, 0, 0, 0, 0, src.Get(), 0, &box);
-                latest = pool[poolIdx];
-                poolIdx = (poolIdx + 1) % kPoolSize;
+                if (SUCCEEDED(res.As(&src))) {
+                    ctx->CopyResource(latest.Get(), src.Get());
+                    haveFrame = true;
+                }
+                src.Reset();
+                res.Reset();
                 dup->ReleaseFrame();
             }
-
-            if (clock::now() < due || !latest) continue;  // not time yet (new frame arrived early)
-
-            // Submit `latest` (repeats the last frame if the screen didn't change).
-            // Copy into the next pool slot so the encoder's texture is never overwritten.
-            ID3D11Texture2D* slot = pool[poolIdx].Get();
-            if (slot != latest.Get()) ctx->CopyResource(slot, latest.Get());
-            ComPtr<ID3D11Texture2D> submit = pool[poolIdx];
-            poolIdx = (poolIdx + 1) % kPoolSize;
-
-            ComPtr<IMFMediaBuffer> buf;
-            if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), submit.Get(), 0, FALSE, &buf))) {
-                buf->SetCurrentLength(w * h * 4);
-                ComPtr<IMFSample> sample;
-                MFCreateSample(&sample);
-                sample->AddBuffer(buf.Get());
-                sample->SetSampleTime(frameIndex * frameDur100ns);
-                sample->SetSampleDuration(frameDur100ns);
-                writer->WriteSample(0, sample.Get());
-            }
-            ++frameIndex;
         }
+
+        pump();
+
+        // Submit one frame (repeats the last image if the screen didn't change).
+        if (haveFrame && needInput > 0) {
+            D3D11_VIDEO_PROCESSOR_STREAM st = {};
+            st.Enable = TRUE;
+            st.pInputSurface = inView.Get();
+            if (SUCCEEDED(vctx->VideoProcessorBlt(vp.Get(), outViews[slot].Get(), 0, 1, &st))) {
+                ComPtr<IMFMediaBuffer> buf;
+                if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), pool[slot].Get(), 0, FALSE, &buf))) {
+                    buf->SetCurrentLength(outW * outH * 3 / 2);
+                    ComPtr<IMFSample> sample;
+                    MFCreateSample(&sample);
+                    sample->AddBuffer(buf.Get());
+                    sample->SetSampleTime(idx * dur100ns);
+                    sample->SetSampleDuration(dur100ns);
+                    if (SUCCEEDED(mft->ProcessInput(0, sample.Get(), 0))) {
+                        --needInput;
+                        slot = (slot + 1) % kPool;
+                    }
+                }
+            }
+        }
+        ++idx;
     }
 
-    if (writing) writer->Finalize();
-    writer.Reset();
-    goto cleanup;
+    // ---------- Finish: flush encoder, close file ----------
+    mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+    mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    ULONGLONG deadline = GetTickCount64() + 3000;
+    while (!drained && GetTickCount64() < deadline) {
+        pump();
+        Sleep(5);
+    }
+    pump();
+    mkv.Close();
 
-fail:
-    m_error = err ? err : L"Unknown error.";
-    m_failed = true;
-
-cleanup:
-    dup.Reset();
-    for (auto& t : pool) t.Reset();
-    latest.Reset();
-    devMgr.Reset();
-    ctx.Reset();
-    dev.Reset();
-    MFShutdown();
-    CoUninitialize();
-    m_running = false;
+    mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+    if (timer) CloseHandle(timer);
+    if (plainTimer) timeEndPeriod(1);
+    return nullptr;
 }
