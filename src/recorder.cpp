@@ -5,9 +5,12 @@
 
 #include "recorder.h"
 #include "mkv_writer.h"
+#include "wgc_capture.h"
+#include "audio_capture.h"
 
 #include <windows.h>
 #include <timeapi.h>
+#include <avrt.h>
 #include <oleauto.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -22,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <memory>
 
 using Microsoft::WRL::ComPtr;
 
@@ -79,7 +83,9 @@ void Recorder::Stop() {
 void Recorder::Loop(std::wstring path, RecorderConfig cfg) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  // never fight the game
+    // MMCSS "Capture" gives steady scheduling (below-normal priority made frame timing uneven on 2-core CPUs).
+    DWORD mmTask = 0;
+    HANDLE mm = AvSetMmThreadCharacteristicsW(L"Capture", &mmTask);
 
     const wchar_t* err = Session(path, cfg);
     if (err && !m_ready.load()) {
@@ -87,6 +93,7 @@ void Recorder::Loop(std::wstring path, RecorderConfig cfg) {
         m_failed = true;
     }
 
+    if (mm) AvRevertMmThreadCharacteristics(mm);
     MFShutdown();
     CoUninitialize();
     m_running = false;
@@ -111,10 +118,26 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
     }
 
-    // ---------- Desktop Duplication ----------
+    // ---------- Capture source: Windows Graphics Capture (window or monitor), else Desktop Duplication ----------
+    WgcCapture wgc;  // declared after dev/ctx so it is destroyed first
+    bool useWgc = false;
     ComPtr<IDXGIOutputDuplication> dup;
     UINT srcW = 0, srcH = 0;
-    {
+    const char* captureKind = "";
+    if (WgcCapture::Supported()) {
+        HWND hwnd = (HWND)cfg.targetWindow;
+        HMONITOR mon = (HMONITOR)cfg.targetMonitor;
+        if (!mon) mon = MonitorFromWindow(hwnd ? hwnd : GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
+        if (hwnd && IsWindow(hwnd)) {
+            useWgc = wgc.Create(dev.Get(), ctx.Get(), hwnd, nullptr, srcW, srcH);
+            captureKind = "window (Windows Graphics Capture)";
+        }
+        if (!useWgc) {
+            useWgc = wgc.Create(dev.Get(), ctx.Get(), nullptr, mon, srcW, srcH);
+            captureKind = "monitor (Windows Graphics Capture)";
+        }
+    }
+    if (!useWgc) {
         ComPtr<IDXGIDevice> dxgiDev;
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<IDXGIOutput> output;
@@ -129,6 +152,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         dup->GetDesc(&dd);
         srcW = dd.ModeDesc.Width;
         srcH = dd.ModeDesc.Height;
+        captureKind = "monitor (Desktop Duplication fallback)";
     }
 
     // ---------- Capture target (full-res BGRA) ----------
@@ -289,6 +313,20 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     MkvWriter mkv;
     if (!mkv.Open(path, (int)outW, (int)outH, fps)) return L"Could not create the output file.";
 
+    // ---------- Audio tracks (no UI, one small thread per source) ----------
+    std::vector<std::unique_ptr<AudioCapture>> audio;
+    {
+        const uint8_t asc[2] = {0x11, 0x90};  // AAC-LC, 48 kHz, stereo
+        if (cfg.gameAudio) {
+            mkv.AddAudioTrack(2, 48000, 2, asc, 2, "Game audio");
+            audio.emplace_back(new AudioCapture(true, 2));
+        }
+        if (cfg.mic) {
+            mkv.AddAudioTrack(3, 48000, 2, asc, 2, "Microphone");
+            audio.emplace_back(new AudioCapture(false, 3));
+        }
+    }
+
     // ---------- Encoder event handling ----------
     int needInput = 0;
     bool drained = false;
@@ -379,7 +417,8 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     }
 
     grabSeqHeader();
-    sprintf_s(lb, "start: capture %ux%u -> %ux%u @ %d fps, %d kbps", srcW, srcH, outW, outH, fps, kbps);
+    sprintf_s(lb, "start: %s %ux%u -> %ux%u @ %d fps, %d kbps, game audio=%d, mic=%d",
+              captureKind, srcW, srcH, outW, outH, fps, kbps, (int)cfg.gameAudio, (int)cfg.mic);
     LogLine(path, lb);
 
     m_ready = true;
@@ -388,6 +427,13 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     LARGE_INTEGER fq, t0;
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&t0);
+    {
+        // QPC -> 100 ns without overflow (same clock WASAPI uses for packet timestamps)
+        int64_t q = t0.QuadPart, f = fq.QuadPart;
+        int64_t t0_100ns = (q / f) * 10000000LL + (q % f) * 10000000LL / f;
+        for (auto& a : audio) a->Start(&mkv, t0_100ns);
+    }
+    if (useWgc) wgc.Begin(latest.Get(), srcW, srcH);
     const LONGLONG dur100ns = 10000000LL / fps;
     LONGLONG idx = 0;
     bool haveFrame = false;
@@ -408,8 +454,12 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
             idx = (now.QuadPart - t0.QuadPart) * fps / fq.QuadPart;
         }
 
-        // Grab the newest screen image (if the screen changed).
-        {
+        // Newest image of the window/screen.
+        if (useWgc) {
+            // Frames are copied into `latest` by the capture callback the moment they arrive.
+            if (wgc.Frames() > 0) haveFrame = true;
+            if (!wgc.Alive()) break;  // the recorded window was closed: stop and save
+        } else {
             DXGI_OUTDUPL_FRAME_INFO fi;
             ComPtr<IDXGIResource> res;
             hr = dup->AcquireNextFrame(0, &fi, &res);
@@ -462,7 +512,9 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         ++idx;
     }
 
-    // ---------- Finish: flush encoder, close file ----------
+    // ---------- Finish: stop capture and audio, flush encoder, close file ----------
+    wgc.Stop();
+    for (auto& a : audio) a->Stop();
     mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     ULONGLONG deadline = GetTickCount64() + 3000;
@@ -472,6 +524,8 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     }
     pump();
     mkv.Close();
+    sprintf_s(lb, "capture frames received: %llu", (unsigned long long)wgc.Frames());
+    LogLine(path, lb);
     sprintf_s(lb, "stop: need-input events=%d, frames submitted=%d, encoder outputs=%d, header=%s",
               nNeedEvents, nSubmitted, nOutputs, mkv.HasParamSets() ? "yes" : "no");
     LogLine(path, lb);
