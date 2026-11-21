@@ -12,15 +12,21 @@ add_executable(GKPRORecorder WIN32
     src/recorder.cpp
     src/recorder.h
     src/mkv_writer.h
+    src/wgc_capture.cpp
+    src/wgc_capture.h
+    src/audio_capture.cpp
+    src/audio_capture.h
+    src/mp4_remux.cpp
+    src/mp4_remux.h
 )
 
 target_compile_definitions(GKPRORecorder PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 target_link_libraries(GKPRORecorder PRIVATE
-    d3d11 dxgi mfplat mfuuid strmiids ole32 oleaut32 shell32 user32 winmm
+    d3d11 dxgi mfplat mfuuid strmiids ole32 oleaut32 shell32 user32 winmm avrt windowsapp
 )
 
 if(MSVC)
-    target_compile_options(GKPRORecorder PRIVATE /O2 /GL /W3)
+    target_compile_options(GKPRORecorder PRIVATE /O2 /GL /W3 /EHsc /Zc:__cplusplus)
     target_link_options(GKPRORecorder PRIVATE /LTCG /OPT:REF /OPT:ICF)
 endif()
