@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -19,11 +20,34 @@ public:
     }
 
     // One H.264 access unit in Annex-B format (start codes). ptsMs = timestamp in ms.
-    void WriteAccessUnit(const uint8_t* data, size_t size, int64_t ptsMs) {
+    // Optional: SPS/PPS from the encoder's output type (Annex-B blob).
+    void SetSequenceHeader(const uint8_t* d, size_t n) {
+        std::vector<Nal> nals;
+        SplitNals(d, n, nals);
+        for (auto& x : nals) {
+            if (x.n == 0) continue;
+            int t = x.p[0] & 0x1F;
+            if (t == 7) m_sps.assign(x.p, x.p + x.n);
+            if (t == 8) m_pps.assign(x.p, x.p + x.n);
+        }
+    }
+    bool HasParamSets() const { return !m_sps.empty() && !m_pps.empty(); }
+
+    void WriteAccessUnit(const uint8_t* data, size_t size, int64_t ptsMs, bool keyHint = false) {
         if (m_file == INVALID_HANDLE_VALUE) return;
 
         std::vector<Nal> nals;
         SplitNals(data, size, nals);
+        if (nals.empty()) {  // not Annex-B: try 4-byte length-prefixed NALs
+            size_t i = 0;
+            while (i + 4 <= size) {
+                size_t n = ((size_t)data[i] << 24) | ((size_t)data[i + 1] << 16) | ((size_t)data[i + 2] << 8) | data[i + 3];
+                i += 4;
+                if (n == 0 || i + n > size) break;
+                nals.push_back({data + i, n});
+                i += n;
+            }
+        }
 
         Buf payload;
         bool key = false;
@@ -42,9 +66,14 @@ public:
             payload.insert(payload.end(), n.p, n.p + n.n);
         }
         if (payload.empty()) return;
+        if (keyHint) key = true;
+        if (!sps.empty()) m_sps = sps;
+        if (!pps.empty()) m_pps = pps;
+        sps = m_sps;
+        pps = m_pps;
 
         if (!m_headerDone) {
-            if (!key || sps.empty() || pps.empty()) return;  // wait for the first keyframe with SPS/PPS
+            if (!key || sps.empty() || pps.empty()) return;  // wait for first keyframe + SPS/PPS
             WriteHeader(sps, pps);
             m_headerDone = true;
             m_basePts = ptsMs;
@@ -84,6 +113,7 @@ private:
     bool m_headerDone = false;
     int64_t m_basePts = 0, m_clusterTs = 0;
     Buf m_cluster;
+    Buf m_sps, m_pps;
 
     static void SplitNals(const uint8_t* d, size_t sz, std::vector<Nal>& out) {
         ptrdiff_t start = -1;
