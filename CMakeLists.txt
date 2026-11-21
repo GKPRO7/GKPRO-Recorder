@@ -11,12 +11,13 @@ add_executable(GKPRORecorder WIN32
     src/main.cpp
     src/recorder.cpp
     src/recorder.h
+    src/mkv_writer.h
 )
 
 target_compile_definitions(GKPRORecorder PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 target_link_libraries(GKPRORecorder PRIVATE
-    d3d11 dxgi mfplat mfreadwrite mfuuid ole32 shell32 user32
+    d3d11 dxgi mfplat mfuuid strmiids ole32 oleaut32 shell32 user32 winmm
 )
 
 if(MSVC)
