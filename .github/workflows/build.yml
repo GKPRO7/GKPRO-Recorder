@@ -1,0 +1,55 @@
+name: Build GKPRO Recorder
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 2>&1 | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build (Release)
+        shell: pwsh
+        run: |
+          cmake --build build --config Release 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Show errors on the summary page
+        if: failure()
+        shell: pwsh
+        run: |
+          $lines = @()
+          foreach ($f in 'configure.log','build.log') {
+            if (Test-Path $f) {
+              $lines += Select-String -Path $f -Pattern 'error (C|LNK|MSB)\d+|CMake Error|fatal error' |
+                        ForEach-Object { $_.Line.Trim() }
+            }
+          }
+          $lines = $lines | Select-Object -Unique | Select-Object -First 40
+          $md = "### Build errors (copy this block)`n`n" + '```' + "`n" + ($lines -join "`n") + "`n" + '```'
+          $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: GKPRORecorder
+          path: build/Release/GKPRORecorder.exe
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore
