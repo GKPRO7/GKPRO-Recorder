@@ -5,16 +5,18 @@
 
 struct RecorderConfig {
     int fps = 30;
-    int outWidth = 1280;      // 720p default (best balance for low-end PCs)
+    int outWidth = 1280;       // 720p default
     int outHeight = 720;
-    int bitrateKbps = 5000;   // good quality for 720p30
+    int bitrateKbps = 5000;
+    void* targetWindow = nullptr;   // HWND to record; null = whole monitor
+    void* targetMonitor = nullptr;  // HMONITOR used when targetWindow is null
+    bool gameAudio = true;          // system/game sound (WASAPI loopback)
+    bool mic = false;               // microphone as a separate track
 };
 
 class Recorder {
 public:
     ~Recorder() { Stop(); }
-
-    // Starts recording the primary monitor to an MKV file. Returns false on failure.
     bool Start(const std::wstring& path, const RecorderConfig& cfg);
     void Stop();
     bool IsRecording() const { return m_running.load(); }
