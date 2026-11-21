@@ -4,15 +4,17 @@
 #include <thread>
 
 struct RecorderConfig {
-    int fps = 30;            // 30 is the low-end default; use 60 on stronger PCs
-    int bitrateKbps = 0;     // 0 = auto (based on resolution and fps)
+    int fps = 30;
+    int outWidth = 1280;      // 720p default (best balance for low-end PCs)
+    int outHeight = 720;
+    int bitrateKbps = 5000;   // good quality for 720p30
 };
 
 class Recorder {
 public:
     ~Recorder() { Stop(); }
 
-    // Starts recording the primary monitor to an MP4 file. Returns false on failure.
+    // Starts recording the primary monitor to an MKV file. Returns false on failure.
     bool Start(const std::wstring& path, const RecorderConfig& cfg);
     void Stop();
     bool IsRecording() const { return m_running.load(); }
@@ -20,6 +22,7 @@ public:
 
 private:
     void Loop(std::wstring path, RecorderConfig cfg);
+    const wchar_t* Session(const std::wstring& path, const RecorderConfig& cfg);
 
     std::thread m_thread;
     std::atomic<bool> m_running{false};
