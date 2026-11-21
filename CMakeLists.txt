@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(GKPRORecorder LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Static CRT: no redistributable needed, smaller memory footprint
@@ -20,7 +20,7 @@ add_executable(GKPRORecorder WIN32
     src/mp4_remux.h
 )
 
-target_compile_definitions(GKPRORecorder PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_definitions(GKPRORecorder PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
 
 target_link_libraries(GKPRORecorder PRIVATE
     d3d11 dxgi mfplat mfuuid strmiids ole32 oleaut32 shell32 user32 winmm avrt windowsapp
