@@ -11,24 +11,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
+      - name: Configure (64-bit recorder + hook)
         shell: pwsh
         run: |
           cmake -S . -B build -A x64 2>&1 | Tee-Object -FilePath configure.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Build (Release)
+      - name: Build 64-bit
         shell: pwsh
         run: |
           cmake --build build --config Release 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Configure (32-bit hook for 32-bit games)
+        shell: pwsh
+        run: |
+          cmake -S . -B build32 -A Win32 -DGKPRO_HOOK_ONLY=ON 2>&1 | Tee-Object -FilePath configure32.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build 32-bit hook
+        shell: pwsh
+        run: |
+          cmake --build build32 --config Release 2>&1 | Tee-Object -FilePath build32.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/GKPRORecorder.exe dist/
+          Copy-Item build/Release/gkhook64.dll dist/
+          Copy-Item build32/Release/gkhook32.dll dist/
+          Copy-Item build32/Release/gkinject32.exe dist/
+          Get-ChildItem dist
 
       - name: Show errors on the summary page
         if: failure()
         shell: pwsh
         run: |
           $lines = @()
-          foreach ($f in 'configure.log','build.log') {
+          foreach ($f in 'configure.log','build.log','configure32.log','build32.log') {
             if (Test-Path $f) {
               $lines += Select-String -Path $f -Pattern 'error (C|LNK|MSB)\d+|CMake Error|fatal error' |
                         ForEach-Object { $_.Line.Trim() }
@@ -38,13 +60,13 @@ jobs:
           $md = "### Build errors (copy this block)`n`n" + '```' + "`n" + ($lines -join "`n") + "`n" + '```'
           $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Upload exe
+      - name: Upload (exe + hook files, keep them in one folder)
         uses: actions/upload-artifact@v4
         with:
           name: GKPRORecorder
-          path: build/Release/GKPRORecorder.exe
+          path: dist
 
-      - name: Upload build log
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -52,4 +74,6 @@ jobs:
           path: |
             configure.log
             build.log
+            configure32.log
+            build32.log
           if-no-files-found: ignore
