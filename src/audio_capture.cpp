@@ -168,7 +168,7 @@ void AudioCapture::Run() {
         ac->Start();
 
         while (m_run.load()) {
-            Sleep(10);
+            Sleep(20);
             UINT32 pkt = 0;
             while (SUCCEEDED(cap->GetNextPacketSize(&pkt)) && pkt > 0) {
                 BYTE* d = nullptr;

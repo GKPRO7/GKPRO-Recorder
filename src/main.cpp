@@ -1,4 +1,4 @@
-// GKPRO Recorder v0.2 - tiny tray app. F9 = start/stop. Right-click the tray icon for options.
+// GKPRO Recorder v0.3 - tiny tray app. F9 = start/stop. Right-click the tray icon for options.
 // No window, no UI framework: idle RAM stays very small.
 
 #include <windows.h>
@@ -18,11 +18,13 @@ constexpr UINT_PTR TIMER_POLL = 1;
 enum : UINT {
     ID_TOGGLE = 1001, ID_OPEN = 1002, ID_EXIT = 1003,
     ID_MODE_WINDOW = 1010, ID_MODE_SCREEN = 1011,
-    ID_GAME_AUDIO = 1012, ID_MIC = 1013, ID_AUTO_MP4 = 1014, ID_DEL_MKV = 1015
+    ID_GAME_AUDIO = 1012, ID_MIC = 1013, ID_AUTO_MP4 = 1014, ID_DEL_MKV = 1015,
+    ID_MODE_HOOK = 1016, ID_PRESET_BASE = 1100, ID_PRESET_CUSTOM = 1199
 };
 
 struct Settings {
-    int captureMode = 0;   // 0 = active game window, 1 = full screen
+    int captureMode = 0;   // 0 = game window (Windows Graphics Capture), 1 = full screen, 2 = game hook (fullscreen/OpenGL/D3D9/D3D11)
+    int preset = 1;        // index into kPresets, or 99 = custom values from settings.ini
     int gameAudio = 1;
     int mic = 0;
     int autoMp4 = 1;
@@ -62,6 +64,9 @@ void LoadSettings() {
     std::wstring ini = IniPath();
     auto rd = [&](const wchar_t* k, int d) { return (int)GetPrivateProfileIntW(L"GKPRO", k, d, ini.c_str()); };
     g_set.captureMode = rd(L"CaptureMode", 0);
+    g_set.preset = rd(L"Preset", 1);
+    if (g_set.captureMode > 2) g_set.captureMode = 0;
+    if (g_set.preset > 4 && g_set.preset != 99) g_set.preset = 1;
     g_set.gameAudio = rd(L"GameAudio", 1);
     g_set.mic = rd(L"Microphone", 0);
     g_set.autoMp4 = rd(L"AutoMp4", 1);
@@ -79,6 +84,7 @@ void SaveSettings() {
     std::wstring ini = IniPath();
     auto wr = [&](const wchar_t* k, int v) { WritePrivateProfileStringW(L"GKPRO", k, std::to_wstring(v).c_str(), ini.c_str()); };
     wr(L"CaptureMode", g_set.captureMode);
+    wr(L"Preset", g_set.preset);
     wr(L"GameAudio", g_set.gameAudio);
     wr(L"Microphone", g_set.mic);
     wr(L"AutoMp4", g_set.autoMp4);
@@ -89,7 +95,28 @@ void SaveSettings() {
     wr(L"BitrateKbps", g_set.bitrate);
 }
 
+// ---------- quality presets ----------
+struct Preset { const wchar_t* name; int w, h, fps, kbps; };
+const Preset kPresets[] = {
+    {L"Low-end: 540p, 30 fps (2.5 Mbps)", 960, 540, 30, 2500},
+    {L"720p, 30 fps (5 Mbps)  - default", 1280, 720, 30, 5000},
+    {L"720p, 60 fps (8 Mbps)", 1280, 720, 60, 8000},
+    {L"1080p, 30 fps (8 Mbps)", 1920, 1080, 30, 8000},
+    {L"1080p, 60 fps (12 Mbps)", 1920, 1080, 60, 12000},
+};
+
 // ---------- helpers ----------
+std::wstring ExeDir() {
+    wchar_t p[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    std::wstring s = p;
+    size_t k = s.find_last_of(L'\\');
+    return k == std::wstring::npos ? L"." : s.substr(0, k);
+}
+
+// Gives unused memory back to Windows (keeps the idle footprint in Task Manager tiny).
+void TrimMemory() { SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }
+
 std::wstring OutputDir() {
     PWSTR videos = nullptr;
     std::wstring dir;
@@ -186,6 +213,7 @@ void FinishRecording() {
     } else {
         Balloon(L"GKPRO Recorder", L"Recording saved to Videos\\GKPRO Recorder");
     }
+    TrimMemory();
 }
 
 void Toggle() {
@@ -193,34 +221,58 @@ void Toggle() {
         FinishRecording();
         return;
     }
-    HWND win = (g_set.captureMode == 0) ? PickWindow() : nullptr;
+    // Window and game-hook modes record the window that is in front when F9 is pressed.
+    HWND win = (g_set.captureMode != 1) ? PickWindow() : nullptr;
+    if (g_set.captureMode == 2 && !win) {
+        Balloon(L"GKPRO Recorder", L"Click your game window first, then press F9 (game capture needs a game window).");
+        return;
+    }
+
     RecorderConfig cfg;
-    cfg.fps = g_set.fps;
-    cfg.outWidth = g_set.width;
-    cfg.outHeight = g_set.height;
-    cfg.bitrateKbps = g_set.bitrate;
+    if (g_set.preset >= 0 && g_set.preset < (int)(sizeof(kPresets) / sizeof(kPresets[0]))) {
+        const Preset& p = kPresets[g_set.preset];
+        cfg.outWidth = p.w; cfg.outHeight = p.h; cfg.fps = p.fps; cfg.bitrateKbps = p.kbps;
+    } else {  // custom values from settings.ini
+        cfg.outWidth = g_set.width; cfg.outHeight = g_set.height; cfg.fps = g_set.fps; cfg.bitrateKbps = g_set.bitrate;
+    }
     cfg.targetWindow = win;
     cfg.targetMonitor = nullptr;
     cfg.gameAudio = g_set.gameAudio != 0;
     cfg.mic = g_set.mic != 0;
+    if (g_set.captureMode == 2 && win) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(win, &pid);
+        cfg.hookPid = pid;
+        cfg.hookDir = ExeDir();
+    }
 
     g_curFile = NewFilePath(win);
     if (g_rec.Start(g_curFile, cfg)) {
         g_active = true;
         SetTip(L"GKPRO Recorder - RECORDING (F9 to stop)");
-        if (g_set.captureMode == 0 && !win)
+        if (!g_rec.Warning().empty())
+            Balloon(L"GKPRO Recorder", g_rec.Warning().c_str());
+        else if (g_set.captureMode == 0 && !win)
             Balloon(L"GKPRO Recorder", L"No game window in front, so the whole screen is being recorded.");
     } else {
         Balloon(L"GKPRO Recorder - error", g_rec.LastError().c_str());
     }
+    TrimMemory();
 }
 
 void ShowMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_TOGGLE, g_active ? L"Stop recording (F9)" : L"Start recording (F9)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (g_set.captureMode == 0 ? MF_CHECKED : 0), ID_MODE_WINDOW, L"Record the active game window");
-    AppendMenuW(menu, MF_STRING | (g_set.captureMode == 1 ? MF_CHECKED : 0), ID_MODE_SCREEN, L"Record the full screen");
+    AppendMenuW(menu, MF_STRING | (g_set.captureMode == 0 ? MF_CHECKED : 0), ID_MODE_WINDOW, L"Capture: game window (safe, no injection)");
+    AppendMenuW(menu, MF_STRING | (g_set.captureMode == 2 ? MF_CHECKED : 0), ID_MODE_HOOK, L"Capture: game hook (fullscreen, OpenGL, DX9/DX11)");
+    AppendMenuW(menu, MF_STRING | (g_set.captureMode == 1 ? MF_CHECKED : 0), ID_MODE_SCREEN, L"Capture: full screen");
+    HMENU presets = CreatePopupMenu();
+    for (int i = 0; i < (int)(sizeof(kPresets) / sizeof(kPresets[0])); ++i)
+        AppendMenuW(presets, MF_STRING | (g_set.preset == i ? MF_CHECKED : 0), ID_PRESET_BASE + i, kPresets[i].name);
+    AppendMenuW(presets, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(presets, MF_STRING | (g_set.preset == 99 ? MF_CHECKED : 0), ID_PRESET_CUSTOM, L"Custom (from settings.ini)");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)presets, L"Quality preset");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g_set.gameAudio ? MF_CHECKED : 0), ID_GAME_AUDIO, L"Record game audio");
     AppendMenuW(menu, MF_STRING | (g_set.mic ? MF_CHECKED : 0), ID_MIC, L"Record microphone");
@@ -234,7 +286,7 @@ void ShowMenu(HWND hwnd) {
     GetCursorPos(&p);
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, nullptr);
-    DestroyMenu(menu);
+    DestroyMenu(menu);  // also destroys the preset submenu
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -268,8 +320,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_EXIT: DestroyWindow(hwnd); break;
         case ID_MODE_WINDOW: g_set.captureMode = 0; SaveSettings(); break;
         case ID_MODE_SCREEN: g_set.captureMode = 1; SaveSettings(); break;
+        case ID_MODE_HOOK:
+            if (MessageBoxW(hwnd,
+                    L"Game capture injects a small DLL into the game to record exclusive-fullscreen, OpenGL and older DirectX games.\n\n"
+                    L"Do NOT use it with online games that have anti-cheat (EasyAntiCheat, BattlEye, Vanguard, ...): it could get your account banned.\n\n"
+                    L"Use game capture?",
+                    L"GKPRO Recorder - game capture", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                g_set.captureMode = 2;
+                SaveSettings();
+            }
+            break;
+        case ID_PRESET_CUSTOM: g_set.preset = 99; SaveSettings(); break;
         case ID_GAME_AUDIO: g_set.gameAudio = !g_set.gameAudio; SaveSettings(); break;
         case ID_MIC: g_set.mic = !g_set.mic; SaveSettings(); break;
+        default:
+            if (LOWORD(wp) >= ID_PRESET_BASE && LOWORD(wp) < ID_PRESET_BASE + (int)(sizeof(kPresets) / sizeof(kPresets[0]))) {
+                g_set.preset = LOWORD(wp) - ID_PRESET_BASE;
+                SaveSettings();
+            }
+            break;
         case ID_AUTO_MP4: g_set.autoMp4 = !g_set.autoMp4; SaveSettings(); break;
         case ID_DEL_MKV: g_set.deleteMkv = !g_set.deleteMkv; SaveSettings(); break;
         }
@@ -316,9 +385,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (!RegisterHotKey(g_hwnd, HOTKEY_ID, MOD_NOREPEAT, VK_F9))
         Balloon(L"GKPRO Recorder", L"F9 is in use by another app. Use the tray menu instead.");
     else
-        Balloon(L"GKPRO Recorder v0.2", L"Running in the tray. Click your game, then press F9 to record it.");
+        Balloon(L"GKPRO Recorder v0.3", L"Running in the tray. Click your game, then press F9 to record it.");
 
-    SetTimer(g_hwnd, TIMER_POLL, 500, nullptr);
+    SetTimer(g_hwnd, TIMER_POLL, 1000, nullptr);
+    TrimMemory();
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {

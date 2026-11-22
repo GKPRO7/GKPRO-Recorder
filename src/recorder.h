@@ -12,15 +12,18 @@ struct RecorderConfig {
     void* targetMonitor = nullptr;  // HMONITOR used when targetWindow is null
     bool gameAudio = true;          // system/game sound (WASAPI loopback)
     bool mic = false;               // microphone as a separate track
+    unsigned long hookPid = 0;      // != 0: use game capture (hook) on this process
+    std::wstring hookDir;           // folder holding gkhook64.dll / gkhook32.dll / gkinject32.exe
 };
 
 class Recorder {
 public:
     ~Recorder() { Stop(); }
-    bool Start(const std::wstring& path, const RecorderConfig& cfg);
+    bool Start(const std::wstring& path, const RecorderConfig& cfg);  // path = .mkv file
     void Stop();
     bool IsRecording() const { return m_running.load(); }
     const std::wstring& LastError() const { return m_error; }
+    const std::wstring& Warning() const { return m_warning; }  // non-fatal notice (e.g. hook failed, fell back)
 
 private:
     void Loop(std::wstring path, RecorderConfig cfg);
@@ -31,4 +34,5 @@ private:
     std::atomic<bool> m_ready{false};
     std::atomic<bool> m_failed{false};
     std::wstring m_error;
+    std::wstring m_warning;
 };

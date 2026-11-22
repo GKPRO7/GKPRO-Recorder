@@ -7,6 +7,7 @@
 #include "mkv_writer.h"
 #include "wgc_capture.h"
 #include "audio_capture.h"
+#include "hook_capture.h"
 
 #include <windows.h>
 #include <timeapi.h>
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <vector>
 #include <memory>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
@@ -36,7 +38,7 @@ using Microsoft::WRL::ComPtr;
 #define REQ(hr, msg) do { if (FAILED(hr)) return msg; } while (0)
 
 namespace {
-constexpr int kPool = 12;  // NV12 720p frames are only ~1.4 MB each
+constexpr int kPool = 8;  // encoder frames in flight (kept small to save GPU/shared memory)
 
 void LogLine(const std::wstring& path, const char* text) {
     HANDLE f = CreateFileW((path + L".log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
@@ -118,13 +120,27 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
     }
 
-    // ---------- Capture source: Windows Graphics Capture (window or monitor), else Desktop Duplication ----------
-    WgcCapture wgc;  // declared after dev/ctx so it is destroyed first
+    // ---------- Capture source: game hook (fullscreen/OpenGL/D3D9/D3D11), else Windows Graphics Capture, else Desktop Duplication ----------
+    HookCapture hook;  // declared after dev/ctx so it is destroyed first
+    WgcCapture wgc;
+    bool useHook = false;
     bool useWgc = false;
     ComPtr<IDXGIOutputDuplication> dup;
     UINT srcW = 0, srcH = 0;
     const char* captureKind = "";
-    if (WgcCapture::Supported()) {
+    std::string hookErr;
+    if (cfg.hookPid) {
+        if (hook.Start((DWORD)cfg.hookPid, fps, cfg.hookDir, dev.Get(), hookErr)) {
+            useHook = true;
+            srcW = hook.Width();
+            srcH = hook.Height();
+            static const char* kApi[] = {"?", "Direct3D 10/11", "Direct3D 9", "OpenGL"};
+            captureKind = kApi[hook.Api() >= 1 && hook.Api() <= 3 ? hook.Api() : 0];
+        } else {
+            m_warning = L"Game capture did not work for this game, so window capture is used instead (see the .log file).";
+        }
+    }
+    if (!useHook && WgcCapture::Supported()) {
         HWND hwnd = (HWND)cfg.targetWindow;
         HMONITOR mon = (HMONITOR)cfg.targetMonitor;
         if (!mon) mon = MonitorFromWindow(hwnd ? hwnd : GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
@@ -137,7 +153,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
             captureKind = "monitor (Windows Graphics Capture)";
         }
     }
-    if (!useWgc) {
+    if (!useHook && !useWgc) {
         ComPtr<IDXGIDevice> dxgiDev;
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<IDXGIOutput> output;
@@ -155,9 +171,9 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         captureKind = "monitor (Desktop Duplication fallback)";
     }
 
-    // ---------- Capture target (full-res BGRA) ----------
+    // ---------- Capture target (full-res BGRA), only for window/monitor capture ----------
     ComPtr<ID3D11Texture2D> latest;
-    {
+    if (!useHook) {
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = srcW; td.Height = srcH; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -168,7 +184,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         REQ(hr, L"Out of GPU memory.");
     }
 
-    // ---------- GPU video processor: scale + BGRA -> NV12 ----------
+    // ---------- GPU video processor: scale + any RGB format -> NV12 ----------
     ComPtr<ID3D11VideoDevice> vdev;
     ComPtr<ID3D11VideoContext> vctx;
     ComPtr<ID3D11VideoProcessorEnumerator> venum;
@@ -176,28 +192,45 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     ComPtr<ID3D11VideoProcessorInputView> inView;
     ComPtr<ID3D11Texture2D> pool[kPool];
     ComPtr<ID3D11VideoProcessorOutputView> outViews[kPool];
+    hr = dev.As(&vdev);  REQ(hr, L"This GPU has no video processor.");
+    hr = ctx.As(&vctx);  REQ(hr, L"This GPU has no video context.");
     {
-        hr = dev.As(&vdev);  REQ(hr, L"This GPU has no video processor.");
-        hr = ctx.As(&vctx);  REQ(hr, L"This GPU has no video context.");
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = outW; td.Height = outH; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_NV12;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        for (int i = 0; i < kPool; ++i) {
+            hr = dev->CreateTexture2D(&td, nullptr, &pool[i]);
+            REQ(hr, L"Could not create NV12 frames (GPU not supported).");
+        }
+    }
+    // (Re)builds the scaler for a source texture. Called at start and when a game changes resolution.
+    auto buildVp = [&](ID3D11Texture2D* srcTex, UINT sw, UINT sh) -> bool {
+        if (!srcTex || !sw || !sh) return false;
+        inView.Reset();
+        vp.Reset();
+        venum.Reset();
+        for (auto& v : outViews) v.Reset();
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
         cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        cd.InputWidth = srcW;  cd.InputHeight = srcH;
+        cd.InputWidth = sw;    cd.InputHeight = sh;
         cd.OutputWidth = outW; cd.OutputHeight = outH;
         cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
-        hr = vdev->CreateVideoProcessorEnumerator(&cd, &venum); REQ(hr, L"Video processor error.");
-        hr = vdev->CreateVideoProcessor(venum.Get(), 0, &vp);   REQ(hr, L"Video processor error.");
+        if (FAILED(vdev->CreateVideoProcessorEnumerator(&cd, &venum))) return false;
+        if (FAILED(vdev->CreateVideoProcessor(venum.Get(), 0, &vp))) return false;
 
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv = {};
         iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        hr = vdev->CreateVideoProcessorInputView(latest.Get(), venum.Get(), &iv, &inView);
-        REQ(hr, L"Video processor input error.");
+        if (FAILED(vdev->CreateVideoProcessorInputView(srcTex, venum.Get(), &iv, &inView))) return false;
 
-        // Keep aspect ratio (letterbox) when the screen is not 16:9.
-        double sc = std::min((double)outW / srcW, (double)outH / srcH);
-        LONG dw = (LONG)(srcW * sc) & ~1, dh = (LONG)(srcH * sc) & ~1;
+        // Keep aspect ratio (letterbox) when the source is not 16:9.
+        double sc = std::min((double)outW / sw, (double)outH / sh);
+        LONG dw = (LONG)(sw * sc) & ~1, dh = (LONG)(sh * sc) & ~1;
         LONG dx = ((LONG)outW - dw) / 2 & ~1, dy = ((LONG)outH - dh) / 2 & ~1;
-        RECT srcRect = {0, 0, (LONG)srcW, (LONG)srcH};
+        RECT srcRect = {0, 0, (LONG)sw, (LONG)sh};
         RECT dstRect = {dx, dy, dx + dw, dy + dh};
         RECT target = {0, 0, (LONG)outW, (LONG)outH};
         vctx->VideoProcessorSetStreamFrameFormat(vp.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
@@ -217,21 +250,14 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         outCs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
         vctx->VideoProcessorSetOutputColorSpace(vp.Get(), &outCs);
 
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = outW; td.Height = outH; td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_NV12;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET;
         for (int i = 0; i < kPool; ++i) {
-            hr = dev->CreateTexture2D(&td, nullptr, &pool[i]);
-            REQ(hr, L"Could not create NV12 frames (GPU not supported).");
             D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {};
             ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            hr = vdev->CreateVideoProcessorOutputView(pool[i].Get(), venum.Get(), &ov, &outViews[i]);
-            REQ(hr, L"Video processor output error.");
+            if (FAILED(vdev->CreateVideoProcessorOutputView(pool[i].Get(), venum.Get(), &ov, &outViews[i]))) return false;
         }
-    }
+        return true;
+    };
+    if (!buildVp(useHook ? hook.Texture() : latest.Get(), srcW, srcH)) return L"Video processor error.";
 
     // ---------- Hardware H.264 encoder (MFT) ----------
     ComPtr<IMFDXGIDeviceManager> devMgr;  // declared before mft => destroyed after it
@@ -420,6 +446,10 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     sprintf_s(lb, "start: %s %ux%u -> %ux%u @ %d fps, %d kbps, game audio=%d, mic=%d",
               captureKind, srcW, srcH, outW, outH, fps, kbps, (int)cfg.gameAudio, (int)cfg.mic);
     LogLine(path, lb);
+    if (!hookErr.empty()) {
+        sprintf_s(lb, "game capture failed: %s", hookErr.c_str());
+        LogLine(path, lb);
+    }
 
     m_ready = true;
 
@@ -436,8 +466,11 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     if (useWgc) wgc.Begin(latest.Get(), srcW, srcH);
     const LONGLONG dur100ns = 10000000LL / fps;
     LONGLONG idx = 0;
-    bool haveFrame = false;
     int slot = 0;
+    uint64_t srcCount = 0;      // frames the source has delivered so far
+    uint64_t lastCount = 0;     // srcCount at the last frame we encoded
+    LONGLONG lastSubmit = 0;    // QPC time of the last encoded frame
+    ComPtr<IMFSample> slotSample[kPool];  // one reusable sample per encoder frame (less allocation per frame)
 
     while (m_running.load()) {
         LARGE_INTEGER now;
@@ -454,10 +487,18 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
             idx = (now.QuadPart - t0.QuadPart) * fps / fq.QuadPart;
         }
 
-        // Newest image of the window/screen.
-        if (useWgc) {
+        // Newest image of the game / window / screen.
+        if (useHook) {
+            if (!hook.Alive()) break;  // the game exited: stop and save
+            if (hook.Update()) {       // the game changed resolution: rebuild the scaler
+                srcW = hook.Width();
+                srcH = hook.Height();
+                if (!buildVp(hook.Texture(), srcW, srcH)) break;
+            }
+            srcCount = hook.Frames();
+        } else if (useWgc) {
             // Frames are copied into `latest` by the capture callback the moment they arrive.
-            if (wgc.Frames() > 0) haveFrame = true;
+            srcCount = wgc.Frames();
             if (!wgc.Alive()) break;  // the recorded window was closed: stop and save
         } else {
             DXGI_OUTDUPL_FRAME_INFO fi;
@@ -468,7 +509,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
                 ComPtr<ID3D11Texture2D> src;
                 if (SUCCEEDED(res.As(&src))) {
                     ctx->CopyResource(latest.Get(), src.Get());
-                    haveFrame = true;
+                    ++srcCount;
                 }
                 src.Reset();
                 res.Reset();
@@ -478,33 +519,46 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
 
         pump();
 
-        // Submit one frame (repeats the last image if the screen didn't change).
-        if (haveFrame && needInput > 0) {
-            D3D11_VIDEO_PROCESSOR_STREAM st = {};
-            st.Enable = TRUE;
-            st.pInputSurface = inView.Get();
-            HRESULT bh = vctx->VideoProcessorBlt(vp.Get(), outViews[slot].Get(), 0, 1, &st);
-            if (FAILED(bh) && ++nBltFail <= 3) {
-                sprintf_s(lb, "VideoProcessorBlt failed 0x%08X", (unsigned)bh);
-                LogLine(path, lb);
-            }
-            if (SUCCEEDED(bh)) {
-                ComPtr<IMFMediaBuffer> buf;
-                if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), pool[slot].Get(), 0, FALSE, &buf))) {
-                    buf->SetCurrentLength(outW * outH * 3 / 2);
-                    ComPtr<IMFSample> sample;
-                    MFCreateSample(&sample);
-                    sample->AddBuffer(buf.Get());
-                    sample->SetSampleTime(idx * dur100ns);
-                    sample->SetSampleDuration(dur100ns);
-                    HRESULT ph = mft->ProcessInput(0, sample.Get(), 0);
-                    if (SUCCEEDED(ph)) {
-                        --needInput;
-                        ++nSubmitted;
-                        slot = (slot + 1) % kPool;
-                    } else if (++nInputFail <= 3) {
-                        sprintf_s(lb, "ProcessInput failed 0x%08X", (unsigned)ph);
-                        LogLine(path, lb);
+        // Encode a frame only when the picture changed (or every 250 ms to keep the video alive):
+        // a static screen or a game below the target fps costs no extra GPU/CPU work.
+        if (srcCount > 0 && needInput > 0) {
+            LARGE_INTEGER nowq;
+            QueryPerformanceCounter(&nowq);
+            const bool fresh = srcCount != lastCount;
+            const bool keepAlive = (nowq.QuadPart - lastSubmit) >= fq.QuadPart / 4;
+            if ((fresh || keepAlive) && (!useHook || hook.Lock(8))) {
+                D3D11_VIDEO_PROCESSOR_STREAM st = {};
+                st.Enable = TRUE;
+                st.pInputSurface = inView.Get();
+                HRESULT bh = vctx->VideoProcessorBlt(vp.Get(), outViews[slot].Get(), 0, 1, &st);
+                if (useHook) hook.Unlock();
+                if (FAILED(bh) && ++nBltFail <= 3) {
+                    sprintf_s(lb, "VideoProcessorBlt failed 0x%08X", (unsigned)bh);
+                    LogLine(path, lb);
+                }
+                if (SUCCEEDED(bh)) {
+                    if (!slotSample[slot]) {
+                        ComPtr<IMFMediaBuffer> buf;
+                        if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), pool[slot].Get(), 0, FALSE, &buf))) {
+                            buf->SetCurrentLength(outW * outH * 3 / 2);
+                            MFCreateSample(&slotSample[slot]);
+                            slotSample[slot]->AddBuffer(buf.Get());
+                        }
+                    }
+                    if (slotSample[slot]) {
+                        slotSample[slot]->SetSampleTime(idx * dur100ns);
+                        slotSample[slot]->SetSampleDuration(dur100ns);
+                        HRESULT ph = mft->ProcessInput(0, slotSample[slot].Get(), 0);
+                        if (SUCCEEDED(ph)) {
+                            --needInput;
+                            ++nSubmitted;
+                            lastCount = srcCount;
+                            lastSubmit = nowq.QuadPart;
+                            slot = (slot + 1) % kPool;
+                        } else if (++nInputFail <= 3) {
+                            sprintf_s(lb, "ProcessInput failed 0x%08X", (unsigned)ph);
+                            LogLine(path, lb);
+                        }
                     }
                 }
             }
@@ -514,6 +568,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
 
     // ---------- Finish: stop capture and audio, flush encoder, close file ----------
     wgc.Stop();
+    hook.Stop();
     for (auto& a : audio) a->Stop();
     mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
@@ -524,7 +579,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     }
     pump();
     mkv.Close();
-    sprintf_s(lb, "capture frames received: %llu", (unsigned long long)wgc.Frames());
+    sprintf_s(lb, "capture frames received: %llu", (unsigned long long)srcCount);
     LogLine(path, lb);
     sprintf_s(lb, "stop: need-input events=%d, frames submitted=%d, encoder outputs=%d, header=%s",
               nNeedEvents, nSubmitted, nOutputs, mkv.HasParamSets() ? "yes" : "no");

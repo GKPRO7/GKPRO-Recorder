@@ -95,7 +95,7 @@ public:
 
         int64_t t = ptsMs - m_basePts;
         if (t < 0) t = 0;
-        if (key || m_cluster.empty() || t - m_clusterTs > 30000) {
+        if (key || m_cluster.empty() || t - m_clusterTs >= 4000) {
             FlushCluster();
             m_clusterTs = t;
         }
@@ -209,14 +209,13 @@ private:
         if (rel > 32767) rel = 32767;
         if (rel < -32768) rel = -32768;
         uint16_t r = (uint16_t)(int16_t)rel;
-        Buf blk;
-        blk.reserve(n + 4);
-        blk.push_back(0x80 | (track & 0x7F));
-        blk.push_back((r >> 8) & 0xFF);
-        blk.push_back(r & 0xFF);
-        blk.push_back(key ? 0x80 : 0x00);
-        blk.insert(blk.end(), d, d + n);
-        Elem(m_cluster, 0xA3, blk);
+        PutId(m_cluster, 0xA3);  // SimpleBlock, written straight into the cluster (no temporary copies)
+        PutSize(m_cluster, n + 4);
+        m_cluster.push_back(0x80 | (track & 0x7F));
+        m_cluster.push_back((r >> 8) & 0xFF);
+        m_cluster.push_back(r & 0xFF);
+        m_cluster.push_back(key ? 0x80 : 0x00);
+        m_cluster.insert(m_cluster.end(), d, d + n);
     }
 
     void WriteHeader() {
