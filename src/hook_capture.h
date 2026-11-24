@@ -14,7 +14,7 @@ public:
     ~HookCapture() { Stop(); }
 
     // Creates the shared memory, injects the hook and waits for the first frame (max ~4 s).
-    bool Start(DWORD pid, int fps, const std::wstring& exeDir, ID3D11Device* dev, std::string& err);
+    bool Start(DWORD pid, int fps, const std::wstring& exeDir, ID3D11Device* dev, const std::wstring& hookLogPath, std::string& err);
     void Stop();
 
     bool Update();   // true when the shared texture changed (new size/format): rebuild the scaler

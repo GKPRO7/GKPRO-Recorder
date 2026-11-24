@@ -19,7 +19,7 @@ enum : UINT {
     ID_TOGGLE = 1001, ID_OPEN = 1002, ID_EXIT = 1003,
     ID_MODE_WINDOW = 1010, ID_MODE_SCREEN = 1011,
     ID_GAME_AUDIO = 1012, ID_MIC = 1013, ID_AUTO_MP4 = 1014, ID_DEL_MKV = 1015,
-    ID_MODE_HOOK = 1016, ID_PRESET_BASE = 1100, ID_PRESET_CUSTOM = 1199
+    ID_MODE_HOOK = 1016, ID_OPEN_LOG = 1017, ID_PRESET_BASE = 1100, ID_PRESET_CUSTOM = 1199
 };
 
 struct Settings {
@@ -66,7 +66,7 @@ void LoadSettings() {
     g_set.captureMode = rd(L"CaptureMode", 0);
     g_set.preset = rd(L"Preset", 1);
     if (g_set.captureMode > 2) g_set.captureMode = 0;
-    if (g_set.preset > 4 && g_set.preset != 99) g_set.preset = 1;
+    if (g_set.preset > 5 && g_set.preset != 99) g_set.preset = 1;
     g_set.gameAudio = rd(L"GameAudio", 1);
     g_set.mic = rd(L"Microphone", 0);
     g_set.autoMp4 = rd(L"AutoMp4", 1);
@@ -103,6 +103,7 @@ const Preset kPresets[] = {
     {L"720p, 60 fps (8 Mbps)", 1280, 720, 60, 8000},
     {L"1080p, 30 fps (8 Mbps)", 1920, 1080, 30, 8000},
     {L"1080p, 60 fps (12 Mbps)", 1920, 1080, 60, 12000},
+    {L"Native: game resolution, 30 fps (sharpest for old games)", 0, 0, 30, 4000},
 };
 
 // ---------- helpers ----------
@@ -281,6 +282,7 @@ void ShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING | (g_set.deleteMkv ? MF_CHECKED : 0), ID_DEL_MKV, L"Delete the MKV after converting");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_OPEN, L"Open recordings folder");
+    AppendMenuW(menu, MF_STRING, ID_OPEN_LOG, L"Open last log (for bug reports)");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
     POINT p;
     GetCursorPos(&p);
@@ -317,6 +319,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case ID_TOGGLE: Toggle(); break;
         case ID_OPEN: ShellExecuteW(nullptr, L"open", OutputDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+        case ID_OPEN_LOG: {
+            if (g_curFile.empty()) { Balloon(L"GKPRO Recorder", L"No recording yet, so there is no log."); break; }
+            std::wstring a = L"\"" + g_curFile + L".log\"";
+            ShellExecuteW(nullptr, L"open", L"notepad.exe", a.c_str(), nullptr, SW_SHOWNORMAL);
+            std::wstring hl = g_curFile + L".hook.log";
+            if (GetFileAttributesW(hl.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                std::wstring b = L"\"" + hl + L"\"";
+                ShellExecuteW(nullptr, L"open", L"notepad.exe", b.c_str(), nullptr, SW_SHOWNORMAL);
+            }
+            break;
+        }
         case ID_EXIT: DestroyWindow(hwnd); break;
         case ID_MODE_WINDOW: g_set.captureMode = 0; SaveSettings(); break;
         case ID_MODE_SCREEN: g_set.captureMode = 1; SaveSettings(); break;

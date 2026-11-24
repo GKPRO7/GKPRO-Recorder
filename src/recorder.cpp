@@ -104,8 +104,8 @@ void Recorder::Loop(std::wstring path, RecorderConfig cfg) {
 const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig& cfg) {
     HRESULT hr;
     const int fps = cfg.fps > 0 ? cfg.fps : 30;
-    const UINT outW = (UINT)cfg.outWidth & ~1u;
-    const UINT outH = (UINT)cfg.outHeight & ~1u;
+    UINT outW = (UINT)(cfg.outWidth > 0 ? cfg.outWidth : 0) & ~1u;   // 0 = match the game's own resolution
+    UINT outH = (UINT)(cfg.outHeight > 0 ? cfg.outHeight : 0) & ~1u;
     const int kbps = cfg.bitrateKbps > 0 ? cfg.bitrateKbps : 5000;
 
     // ---------- D3D11 device ----------
@@ -130,14 +130,15 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     const char* captureKind = "";
     std::string hookErr;
     if (cfg.hookPid) {
-        if (hook.Start((DWORD)cfg.hookPid, fps, cfg.hookDir, dev.Get(), hookErr)) {
+        if (hook.Start((DWORD)cfg.hookPid, fps, cfg.hookDir, dev.Get(), path + L".hook.log", hookErr)) {
             useHook = true;
             srcW = hook.Width();
             srcH = hook.Height();
             static const char* kApi[] = {"?", "Direct3D 10/11", "Direct3D 9", "OpenGL"};
             captureKind = kApi[hook.Api() >= 1 && hook.Api() <= 3 ? hook.Api() : 0];
         } else {
-            m_warning = L"Game capture did not work for this game, so window capture is used instead (see the .log file).";
+            std::wstring why(hookErr.begin(), hookErr.end());
+            m_warning = L"Game capture failed: " + why + L". Using window capture instead (use borderless windowed mode).";
         }
     }
     if (!useHook && WgcCapture::Supported()) {
@@ -169,6 +170,15 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         srcW = dd.ModeDesc.Width;
         srcH = dd.ModeDesc.Height;
         captureKind = "monitor (Desktop Duplication fallback)";
+    }
+
+    // "Native" preset: record at the source resolution (no scaling = sharpest for old low-res games), capped at 1080p.
+    if (outW == 0 || outH == 0) {
+        double w = srcW, h = srcH;
+        double k = std::min(1.0, std::min(1920.0 / w, 1080.0 / h));
+        outW = (UINT)(w * k) & ~1u;
+        outH = (UINT)(h * k) & ~1u;
+        if (outW < 64 || outH < 64) { outW = 1280; outH = 720; }
     }
 
     // ---------- Capture target (full-res BGRA), only for window/monitor capture ----------
@@ -234,6 +244,13 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         RECT dstRect = {dx, dy, dx + dw, dy + dh};
         RECT target = {0, 0, (LONG)outW, (LONG)outH};
         vctx->VideoProcessorSetStreamFrameFormat(vp.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+        vctx->VideoProcessorSetStreamAlpha(vp.Get(), 0, FALSE, 1.0f);  // ignore the game's alpha channel
+        vctx->VideoProcessorSetOutputAlphaFillMode(vp.Get(), D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE, 0);
+        {
+            char b[200];
+            sprintf_s(b, "scaler: source %ux%u -> output %ux%u, picture area %ldx%ld at (%ld,%ld)", sw, sh, outW, outH, dw, dh, dx, dy);
+            LogLine(path, b);
+        }
         vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcRect);
         vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRect);
         vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &target);

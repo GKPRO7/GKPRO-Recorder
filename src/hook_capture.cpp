@@ -22,7 +22,7 @@ bool InjectLoadLibrary(HANDLE proc, const std::wstring& dll) {
 }
 }  // namespace
 
-bool HookCapture::Start(DWORD pid, int fps, const std::wstring& dir, ID3D11Device* dev, std::string& err) {
+bool HookCapture::Start(DWORD pid, int fps, const std::wstring& dir, ID3D11Device* dev, const std::wstring& hookLogPath, std::string& err) {
     m_dev = dev;
     m_proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
                          PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE, FALSE, pid);
@@ -39,6 +39,8 @@ bool HookCapture::Start(DWORD pid, int fps, const std::wstring& dir, ID3D11Devic
     if (!m_shm) { err = "cannot map shared memory"; Stop(); return false; }
 
     const uint64_t baseFrames = m_shm->frameCounter;  // the hook may already be loaded from an earlier recording
+    wcsncpy_s(m_shm->logPath, hookLogPath.c_str(), _TRUNCATE);
+    m_shm->detected = 0;
     m_shm->magic = GKHOOK_MAGIC;
     m_shm->targetFps = (uint32_t)(fps > 0 ? fps : 30);
     m_shm->wantFrames = 1;
@@ -76,7 +78,18 @@ bool HookCapture::Start(DWORD pid, int fps, const std::wstring& dir, ID3D11Devic
         if (!Alive()) break;
         Sleep(25);
     }
-    err = "no frames came from the game (unsupported graphics API such as Vulkan, DirectX 12 or DirectX 8 and older, or the game blocked the hook)";
+    uint32_t det = m_shm ? m_shm->detected : 0;
+    std::string what;
+    if (det & 1) what += "Vulkan (including DXVK), ";
+    if (det & 2) what += "DirectX 12, ";
+    if (det & 4) what += "DirectX 8, ";
+    if (det & 8) what += "DirectDraw (DirectX 7 and older), ";
+    if (!what.empty()) {
+        what.resize(what.size() - 2);
+        err = "this game loads " + what + ", which game capture does not support yet";
+    } else {
+        err = "no frames came from the game (the game may block the hook, or uses an unsupported graphics API)";
+    }
     Stop();
     return false;
 }

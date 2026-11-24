@@ -17,6 +17,8 @@ struct GkHookShared {
     volatile uint32_t dxgiFormat;
     volatile uint32_t hasKeyedMutex;
     volatile uint64_t frameCounter;  // grows by one for every frame the hook delivered
+    volatile uint32_t detected;      // hook -> recorder: bit0 Vulkan, bit1 DX12, bit2 DX8, bit3 DirectDraw loaded in the game
+    wchar_t logPath[260];            // recorder -> hook: where the hook writes its diagnostic log
 };
 
 inline void GkHookShmName(unsigned long pid, wchar_t* out) {
