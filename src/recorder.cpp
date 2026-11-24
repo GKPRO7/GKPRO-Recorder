@@ -219,6 +219,7 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
     // (Re)builds the scaler for a source texture. Called at start and when a game changes resolution.
     auto buildVp = [&](ID3D11Texture2D* srcTex, UINT sw, UINT sh) -> bool {
         if (!srcTex || !sw || !sh) return false;
+        char vb[240];
         inView.Reset();
         vp.Reset();
         venum.Reset();
@@ -229,12 +230,23 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         cd.InputWidth = sw;    cd.InputHeight = sh;
         cd.OutputWidth = outW; cd.OutputHeight = outH;
         cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
-        if (FAILED(vdev->CreateVideoProcessorEnumerator(&cd, &venum))) return false;
-        if (FAILED(vdev->CreateVideoProcessor(venum.Get(), 0, &vp))) return false;
+        HRESULT vh = vdev->CreateVideoProcessorEnumerator(&cd, &venum);
+        if (FAILED(vh)) { sprintf_s(vb, "video processor: CreateVideoProcessorEnumerator failed 0x%08X", (unsigned)vh); LogLine(path, vb); return false; }
+        {
+            D3D11_TEXTURE2D_DESC sdsc;
+            srcTex->GetDesc(&sdsc);
+            UINT fl = 0;
+            venum->CheckVideoProcessorFormat(sdsc.Format, &fl);
+            sprintf_s(vb, "video processor: source format %d, support flags 0x%X (bit0 = usable as input)", (int)sdsc.Format, fl);
+            LogLine(path, vb);
+        }
+        vh = vdev->CreateVideoProcessor(venum.Get(), 0, &vp);
+        if (FAILED(vh)) { sprintf_s(vb, "video processor: CreateVideoProcessor failed 0x%08X", (unsigned)vh); LogLine(path, vb); return false; }
 
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv = {};
         iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        if (FAILED(vdev->CreateVideoProcessorInputView(srcTex, venum.Get(), &iv, &inView))) return false;
+        vh = vdev->CreateVideoProcessorInputView(srcTex, venum.Get(), &iv, &inView);
+        if (FAILED(vh)) { sprintf_s(vb, "video processor: CreateVideoProcessorInputView failed 0x%08X (this GPU may not accept the game's picture format)", (unsigned)vh); LogLine(path, vb); return false; }
 
         // Keep aspect ratio (letterbox) when the source is not 16:9.
         double sc = std::min((double)outW / sw, (double)outH / sh);
@@ -270,11 +282,12 @@ const wchar_t* Recorder::Session(const std::wstring& path, const RecorderConfig&
         for (int i = 0; i < kPool; ++i) {
             D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {};
             ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            if (FAILED(vdev->CreateVideoProcessorOutputView(pool[i].Get(), venum.Get(), &ov, &outViews[i]))) return false;
+            vh = vdev->CreateVideoProcessorOutputView(pool[i].Get(), venum.Get(), &ov, &outViews[i]);
+            if (FAILED(vh)) { sprintf_s(vb, "video processor: CreateVideoProcessorOutputView failed 0x%08X", (unsigned)vh); LogLine(path, vb); return false; }
         }
         return true;
     };
-    if (!buildVp(useHook ? hook.Texture() : latest.Get(), srcW, srcH)) return L"Video processor error.";
+    if (!buildVp(useHook ? hook.Texture() : latest.Get(), srcW, srcH)) return L"The GPU video scaler could not start (details are in the .log file: tray menu, Open last log).";
 
     // ---------- Hardware H.264 encoder (MFT) ----------
     ComPtr<IMFDXGIDeviceManager> devMgr;  // declared before mft => destroyed after it
