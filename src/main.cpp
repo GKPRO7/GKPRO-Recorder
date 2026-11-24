@@ -9,17 +9,22 @@
 #include <thread>
 #include "recorder.h"
 #include "mp4_remux.h"
+#include "hook_capture.h"
+#include <d3d11.h>
+#include <dxgi.h>
+#include <wrl/client.h>
 
 namespace {
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_REMUX_DONE = WM_APP + 2;
 constexpr int HOTKEY_ID = 1;
+constexpr int HOTKEY_TEST_ID = 2;
 constexpr UINT_PTR TIMER_POLL = 1;
 enum : UINT {
     ID_TOGGLE = 1001, ID_OPEN = 1002, ID_EXIT = 1003,
     ID_MODE_WINDOW = 1010, ID_MODE_SCREEN = 1011,
     ID_GAME_AUDIO = 1012, ID_MIC = 1013, ID_AUTO_MP4 = 1014, ID_DEL_MKV = 1015,
-    ID_MODE_HOOK = 1016, ID_OPEN_LOG = 1017, ID_PRESET_BASE = 1100, ID_PRESET_CUSTOM = 1199
+    ID_MODE_HOOK = 1016, ID_OPEN_LOG = 1017, ID_TEST_HOOK = 1018, ID_PRESET_BASE = 1100, ID_PRESET_CUSTOM = 1199
 };
 
 struct Settings {
@@ -261,6 +266,121 @@ void Toggle() {
     TrimMemory();
 }
 
+
+// ---------- one-key game-capture test: click the game, press F10 ----------
+std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+
+std::wstring ReadTextFile(const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return L"";
+    char buf[65536];
+    DWORD n = 0;
+    ReadFile(f, buf, sizeof(buf) - 1, &n, nullptr);
+    CloseHandle(f);
+    buf[n] = 0;
+    int w = MultiByteToWideChar(CP_UTF8, 0, buf, (int)n, nullptr, 0);
+    std::wstring out(w, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, buf, (int)n, &out[0], w);
+    return out;
+}
+
+void TestHook() {
+    if (g_active) { Balloon(L"GKPRO Recorder", L"Stop recording first, then run the test."); return; }
+    HWND win = PickWindow();
+    if (!win) { Balloon(L"GKPRO Recorder", L"Click your game window first, then press F10 to test game capture."); return; }
+    Balloon(L"GKPRO Recorder", L"Testing game capture... this takes about 6 seconds. A report will open in Notepad.");
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(win, &pid);
+    std::wstring r;
+    auto add = [&](const std::wstring& s) { r += s + L"\r\n"; };
+    wchar_t title[128] = {};
+    GetWindowTextW(win, title, 128);
+
+    add(L"=== GKPRO Recorder game-capture test (v0.3) ===");
+    {
+        wchar_t prod[128] = {}, build[32] = {};
+        DWORD sz = sizeof(prod);
+        RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"ProductName", RRF_RT_REG_SZ, nullptr, prod, &sz);
+        sz = sizeof(build);
+        RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"CurrentBuildNumber", RRF_RT_REG_SZ, nullptr, build, &sz);
+        add(std::wstring(L"Windows: ") + prod + L" build " + build);
+    }
+    add(std::wstring(L"Recorder runs as administrator: ") + (IsUserAnAdmin() ? L"yes" : L"no"));
+    add(std::wstring(L"Game window: \"") + title + L"\" (process id " + std::to_wstring(pid) + L")");
+
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (ph) {
+        wchar_t exe[MAX_PATH] = {};
+        DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(ph, 0, exe, &n)) add(std::wstring(L"Game program: ") + exe);
+        BOOL wow = FALSE;
+        IsWow64Process(ph, &wow);
+        add(wow ? L"Game is 32-bit (needs gkhook32.dll + gkinject32.exe)" : L"Game is 64-bit (needs gkhook64.dll)");
+        CloseHandle(ph);
+    } else {
+        add(L"Cannot open the game process even for reading (error " + std::to_wstring(GetLastError()) + L"). Try running GKPRO Recorder as administrator.");
+    }
+
+    const std::wstring dir = ExeDir();
+    for (const wchar_t* f : {L"gkhook64.dll", L"gkhook32.dll", L"gkinject32.exe"})
+        add(std::wstring(f) + (GetFileAttributesW((dir + L"\\" + f).c_str()) != INVALID_FILE_ATTRIBUTES ? L": found" : L": MISSING next to GKPRORecorder.exe"));
+
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    HRESULT dhr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, nullptr);
+    if (SUCCEEDED(dhr)) {
+        Microsoft::WRL::ComPtr<IDXGIDevice> dd;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> ad;
+        DXGI_ADAPTER_DESC desc = {};
+        if (SUCCEEDED(dev.As(&dd)) && SUCCEEDED(dd->GetAdapter(&ad)) && SUCCEEDED(ad->GetDesc(&desc)))
+            add(std::wstring(L"GPU: ") + desc.Description);
+    } else {
+        add(L"Could not create a Direct3D 11 device in the recorder (error " + std::to_wstring((unsigned)dhr) + L")");
+    }
+
+    std::wstring logp = OutputDir() + L"\\GKPRO_hook_test_game.log";
+    DeleteFileW(logp.c_str());
+    if (dev) {
+        HookCapture hc;
+        std::string err;
+        bool ok = hc.Start(pid, 30, dir, dev.Get(), logp, err);
+        if (ok) {
+            uint64_t f0 = hc.Frames();
+            Sleep(1500);
+            uint64_t f1 = hc.Frames();
+            static const wchar_t* kApi[] = {L"unknown", L"Direct3D 10/11", L"Direct3D 9", L"OpenGL"};
+            int a = hc.Api();
+            add(L"");
+            add(std::wstring(L"RESULT: GAME CAPTURE WORKS. API: ") + kApi[a >= 1 && a <= 3 ? a : 0] + L", size " + std::to_wstring(hc.Width()) + L"x" +
+                std::to_wstring(hc.Height()) + L", frames in 1.5 s: " + std::to_wstring(f1 - f0));
+        } else {
+            add(L"");
+            add(L"RESULT: FAILED - " + Widen(err));
+        }
+        hc.Stop();
+    }
+
+    add(L"");
+    add(L"--- log written inside the game by the hook ---");
+    std::wstring hl = ReadTextFile(logp);
+    add(hl.empty() ? L"(no hook log: the hook DLL never started inside the game - it was blocked, or injection failed)" : hl);
+
+    // save as UTF-8 and open in Notepad
+    std::wstring rp = OutputDir() + L"\\GKPRO_hook_test.txt";
+    int n8 = WideCharToMultiByte(CP_UTF8, 0, r.c_str(), (int)r.size(), nullptr, 0, nullptr, nullptr);
+    std::string u8(n8, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, r.c_str(), (int)r.size(), &u8[0], n8, nullptr, nullptr);
+    HANDLE f = CreateFileW(rp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(f, "\xEF\xBB\xBF", 3, &w, nullptr);
+        WriteFile(f, u8.data(), (DWORD)u8.size(), &w, nullptr);
+        CloseHandle(f);
+    }
+    std::wstring arg = L"\"" + rp + L"\"";
+    ShellExecuteW(nullptr, L"open", L"notepad.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
 void ShowMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_TOGGLE, g_active ? L"Stop recording (F9)" : L"Start recording (F9)");
@@ -283,6 +403,7 @@ void ShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_OPEN, L"Open recordings folder");
     AppendMenuW(menu, MF_STRING, ID_OPEN_LOG, L"Open last log (for bug reports)");
+    AppendMenuW(menu, MF_STRING, ID_TEST_HOOK, L"Test game capture on the game in front (F10)");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
     POINT p;
     GetCursorPos(&p);
@@ -295,6 +416,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_HOTKEY:
         if (wp == HOTKEY_ID) Toggle();
+        else if (wp == HOTKEY_TEST_ID) TestHook();
         return 0;
     case WM_TIMER:
         // Recording ended by itself (the game window was closed): save and convert.
@@ -319,6 +441,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case ID_TOGGLE: Toggle(); break;
         case ID_OPEN: ShellExecuteW(nullptr, L"open", OutputDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+        case ID_TEST_HOOK: TestHook(); break;
         case ID_OPEN_LOG: {
             if (g_curFile.empty()) { Balloon(L"GKPRO Recorder", L"No recording yet, so there is no log."); break; }
             std::wstring a = L"\"" + g_curFile + L".log\"";
@@ -362,6 +485,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // let a running MP4 conversion finish (up to ~2 min) so the file is not left half-written
         for (int i = 0; i < 1200 && g_remuxing.load() > 0; ++i) Sleep(100);
         UnregisterHotKey(hwnd, HOTKEY_ID);
+        UnregisterHotKey(hwnd, HOTKEY_TEST_ID);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -395,6 +519,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     wcscpy_s(g_nid.szTip, L"GKPRO Recorder - idle (F9 to record)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
+    RegisterHotKey(g_hwnd, HOTKEY_TEST_ID, MOD_NOREPEAT, VK_F10);
     if (!RegisterHotKey(g_hwnd, HOTKEY_ID, MOD_NOREPEAT, VK_F9))
         Balloon(L"GKPRO Recorder", L"F9 is in use by another app. Use the tray menu instead.");
     else
